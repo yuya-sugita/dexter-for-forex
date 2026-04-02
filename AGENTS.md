@@ -1,105 +1,131 @@
-# Repository Guidelines
+# リポジトリガイドライン
 
-- Repo: https://github.com/virattt/dexter
-- Dexter is a CLI-based AI agent for deep financial research, built with TypeScript, Ink (React for CLI), and LangChain.
+- リポジトリ: https://github.com/yuya-sugita/sapiens
+- SapiensはFX・株価指数・コモディティの定量トレード分析に特化したCLIベースのAIエージェント。Fintokeiプロップトレーディングに最適化。TypeScript、Ink（CLI用React）、LangChainで構築。
 
-## Project Structure
+## プロジェクト構成
 
-- Source code: `src/`
-  - Agent core: `src/agent/` (agent loop, prompts, scratchpad, token counting, types)
-  - CLI interface: `src/cli.tsx` (Ink/React), entry point: `src/index.tsx`
-  - Components: `src/components/` (Ink UI components)
-  - Hooks: `src/hooks/` (React hooks for agent runner, model selection, input history)
-  - Model/LLM: `src/model/llm.ts` (multi-provider LLM abstraction)
-  - Tools: `src/tools/` (financial search, web search, browser, skill tool)
-  - Tool descriptions: `src/tools/descriptions/` (rich descriptions injected into system prompt)
-  - Finance tools: `src/tools/finance/` (prices, fundamentals, filings, insider trades, etc.)
-  - Search tools: `src/tools/search/` (Exa preferred, Tavily fallback)
-  - Browser: `src/tools/browser/` (Playwright-based web scraping)
-  - Skills: `src/skills/` (SKILL.md-based extensible workflows, e.g. DCF valuation)
-  - Utils: `src/utils/` (env, config, caching, token estimation, markdown tables)
-  - Evals: `src/evals/` (LangSmith evaluation runner with Ink UI)
-- Config: `.dexter/settings.json` (persisted model/provider selection)
-- Environment: `.env` (API keys; see `env.example`)
-- Scripts: `scripts/release.sh`
+- ソースコード: `src/`
+  - エージェントコア: `src/agent/`（エージェントループ、プロンプト、スクラッチパッド、トークンカウント、型定義）
+  - CLIインターフェース: `src/cli.tsx`（Ink/React）、エントリポイント: `src/index.tsx`
+  - コンポーネント: `src/components/`（Ink UIコンポーネント）
+  - フック: `src/hooks/`（エージェントランナー、モデル選択、入力履歴用Reactフック）
+  - モデル/LLM: `src/model/llm.ts`（マルチプロバイダLLM抽象化）
+  - ツール: `src/tools/`（FX/CFDツール、Web検索、ブラウザ、スキルツール）
+  - Forexツール: `src/tools/forex/`（市場データ、テクニカル分析、統計分析、マクロ分析、クオンツ戦略、経済カレンダー、Fintokeiルール、トレードジャーナル）
+  - 検索ツール: `src/tools/search/`（Exa優先、Perplexity、Tavilyフォールバック）
+  - ブラウザ: `src/tools/browser/`（PlaywrightベースのWebスクレイピング）
+  - スキル: `src/skills/`（SKILL.mdベースの拡張可能ワークフロー: 定量トレード分析、Fintokeiチャレンジ最適化、リスク管理）
+  - ユーティリティ: `src/utils/`（env、設定、キャッシュ、トークン推定、マークダウンテーブル）
+  - 評価: `src/evals/`（LangSmith評価ランナー + Ink UI）
+- 設定: `.sapiens/settings.json`（モデル/プロバイダ選択の永続化）
+- トレードジャーナル: `.sapiens/journal/trades.json`（トレード記録）
+- 環境変数: `.env`（APIキー、`env.example`参照）
+- スクリプト: `scripts/release.sh`
 
-## Build, Test, and Development Commands
+## ビルド・テスト・開発コマンド
 
-- Runtime: Bun (primary). Use `bun` for all commands.
-- Install deps: `bun install`
-- Run: `bun run start` or `bun run src/index.tsx`
-- Dev (watch mode): `bun run dev`
-- Type-check: `bun run typecheck`
-- Tests: `bun test`
-- Evals: `bun run src/evals/run.ts` (full) or `bun run src/evals/run.ts --sample 10` (sampled)
-- CI runs `bun run typecheck` and `bun test` on push/PR.
+- ランタイム: Bun（プライマリ）。すべてのコマンドに`bun`を使用。
+- 依存関係インストール: `bun install`
+- 実行: `bun run start` または `bun run src/index.tsx`
+- 開発（ウォッチモード）: `bun run dev`
+- 型チェック: `bun run typecheck`
+- テスト: `bun test`
+- 評価: `bun run src/evals/run.ts`（全件）または `bun run src/evals/run.ts --sample 10`（サンプル）
+- CIはpush/PRで `bun run typecheck` と `bun test` を実行。
 
-## Coding Style & Conventions
+## コーディングスタイルと規約
 
-- Language: TypeScript (ESM, strict mode). JSX via React (Ink for CLI rendering).
-- Prefer strict typing; avoid `any`.
-- Keep files concise; extract helpers rather than duplicating code.
-- Add brief comments for tricky or non-obvious logic.
-- Do not add logging unless explicitly asked.
-- Do not create README or documentation files unless explicitly asked.
+- 言語: TypeScript（ESM、strictモード）。JSXはReact経由（Ink CLIレンダリング）。
+- 厳密な型付け推奨。`any`を避ける。
+- ファイルは簡潔に。重複よりヘルパー抽出。
+- トリッキーな部分や非自明なロジックには簡潔なコメント。
+- 明示的に求められない限りログを追加しない。
+- 明示的に求められない限りREADMEやドキュメントファイルを作成しない。
 
-## LLM Providers
+## LLMプロバイダ
 
-- Supported: OpenAI (default), Anthropic, Google, xAI (Grok), OpenRouter, Ollama (local).
-- Default model: `gpt-5.4`. Provider detection is prefix-based (`claude-` -> Anthropic, `gemini-` -> Google, etc.).
-- Fast models for lightweight tasks: see `FAST_MODELS` map in `src/model/llm.ts`.
-- Anthropic uses explicit `cache_control` on system prompt for prompt caching cost savings.
-- Users switch providers/models via `/model` command in the CLI.
+- 対応: OpenAI（デフォルト）、Anthropic、Google、xAI（Grok）、Moonshot、DeepSeek、OpenRouter、Ollama（ローカル）。
+- デフォルトモデル: `gpt-5.4`。プロバイダ検出はプレフィックスベース（`claude-` → Anthropic、`gemini-` → Google等）。
+- 軽量タスク用ファストモデル: `src/model/llm.ts`の`FAST_MODELS`マップ参照。
+- Anthropicはプロンプトキャッシュのコスト削減のためシステムプロンプトに明示的な`cache_control`を使用。
+- ユーザーはCLIの`/model`コマンドでプロバイダ/モデルを切り替え。
 
-## Tools
+## ツール
 
-- `financial_search`: primary tool for all financial data queries (prices, metrics, filings). Delegates to multiple sub-tools internally.
-- `financial_metrics`: direct metric lookups (revenue, market cap, etc.).
-- `read_filings`: SEC filing reader for 10-K, 10-Q, 8-K documents.
-- `web_search`: general web search (Exa if `EXASEARCH_API_KEY` set, else Tavily if `TAVILY_API_KEY` set).
-- `browser`: Playwright-based web scraping for reading pages the agent discovers.
-- `skill`: invokes SKILL.md-defined workflows (e.g. DCF valuation). Each skill runs at most once per query.
-- Tool registry: `src/tools/registry.ts`. Tools are conditionally included based on env vars.
+- `get_market_data`: すべての市場データクエリ用メタツール（価格、ヒストリカルOHLCV、テクニカル指標）。内部でサブツールにルーティング。
+- `get_zscore`: z-スコア分析（パーセンタイルランク、平均回帰確率）。
+- `get_correlation_matrix`: 2-8銘柄間のリターン相関行列。
+- `get_return_distribution`: リターン分布の完全統計分析（歪度、尖度、VaR/CVaR、Hurst指数、自己相関、Jarque-Bera検定）。
+- `get_volatility_regime`: ボラティリティレジーム検出（LOW/NORMAL/HIGH/CRISIS）。
+- `get_rate_differential`: 金利差分析と政策ダイバージェンススコアリング。
+- `get_macro_regime`: 先行指標（GDP/PMI/CPI/失業率/小売）からのマクロレジーム分類。
+- `get_cross_asset_regime`: クロスアセットリスクオン/オフ検出。
+- `backtest_strategy`: 5つの定量戦略のバックテスト（SMAクロス、z-score平均回帰、RSIモメンタム、ボリンジャーブレイクアウト、ドンチャンチャネル）。
+- `monte_carlo_simulation`: Fintokeiチャレンジ結果のモンテカルロシミュレーション。
+- `calculate_expected_value`: 確率加重シナリオからの期待値計算。
+- `economic_calendar`: 影響度付き経済指標イベントの取得。
+- `get_fintokei_rules`: Fintokeiチャレンジルール（利益目標、DD制限、日次ロス制限）。
+- `calculate_position_size`: ケリー基準ベースのポジションサイジング。
+- `check_account_health`: アカウントヘルス評価。
+- `record_trade` / `close_trade`: トレードジャーナルの記録・決済。
+- `get_trade_stats` / `get_trade_history`: Sharpe/Sortino/ケリー基準付きパフォーマンス分析。
+- `web_search`: 汎用Web検索（`EXASEARCH_API_KEY`設定時はExa、なければPerplexity/Tavily）。
+- `browser`: Playwrightベースのブラウザ操作。
+- `skill`: SKILL.md定義ワークフローの呼び出し。各スキルはクエリあたり最大1回実行。
+- ツールレジストリ: `src/tools/registry.ts`。ツールは環境変数に基づいて条件付きで含まれる。
 
-## Skills
+## スキル
 
-- Skills live as `SKILL.md` files with YAML frontmatter (`name`, `description`) and markdown body (instructions).
-- Built-in skills: `src/skills/dcf/SKILL.md`.
-- Discovery: `src/skills/registry.ts` scans for SKILL.md files at startup.
-- Skills are exposed to the LLM as metadata in the system prompt; the LLM invokes them via the `skill` tool.
+- スキルはYAMLフロントマター（`name`、`description`）とマークダウン本文（手順）を持つ`SKILL.md`ファイル。
+- ビルトインスキル:
+  - `src/skills/trade-analysis/SKILL.md` — 8ステップ定量トレード分析ワークフロー
+  - `src/skills/fintokei-challenge/SKILL.md` — モンテカルロベースのFintokeiチャレンジ最適化
+  - `src/skills/risk-management/SKILL.md` — ケリー基準＋ボラティリティ調整＋相関分解のリスク管理
+- 検出: `src/skills/registry.ts`が起動時にSKILL.mdファイルをスキャン。
+- スキルはシステムプロンプトにメタデータとして公開。LLMが`skill`ツールで呼び出す。
 
-## Agent Architecture
+## エージェントアーキテクチャ
 
-- Agent loop: `src/agent/agent.ts`. Iterative tool-calling loop with configurable max iterations (default 10).
-- Scratchpad: `src/agent/scratchpad.ts`. Single source of truth for all tool results within a query.
-- Context management: Anthropic-style. Full tool results kept in context; oldest results cleared when token threshold exceeded.
-- Final answer: generated in a separate LLM call with full scratchpad context (no tools bound).
-- Events: agent yields typed events (`tool_start`, `tool_end`, `thinking`, `answer_start`, `done`, etc.) for real-time UI updates.
+- エージェントループ: `src/agent/agent.ts`。最大反復回数（デフォルト10）の反復ツール呼び出しループ。
+- スクラッチパッド: `src/agent/scratchpad.ts`。クエリ内のすべてのツール結果の単一真実のソース。
+- コンテキスト管理: Anthropicスタイル。フルツール結果をコンテキストに保持。トークン閾値超過時に最も古い結果をクリア。
+- 最終回答: フルスクラッチパッドコンテキストで別のLLM呼び出しで生成（ツールバインドなし）。
+- イベント: エージェントは型付きイベント（`tool_start`、`tool_end`、`thinking`、`answer_start`、`done`等）をリアルタイムUI更新用にyield。
 
-## Environment Variables
+## Fintokei対応銘柄
 
-- LLM keys: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`
-- Ollama: `OLLAMA_BASE_URL` (default `http://127.0.0.1:11434`)
-- Finance: `FINANCIAL_DATASETS_API_KEY`
-- Search: `EXASEARCH_API_KEY` (preferred), `TAVILY_API_KEY` (fallback)
-- Tracing: `LANGSMITH_API_KEY`, `LANGSMITH_ENDPOINT`, `LANGSMITH_PROJECT`, `LANGSMITH_TRACING`
-- Never commit `.env` files or real API keys.
+- FXメジャー: EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, USD/CAD, NZD/USD
+- FXマイナー/クロス: EUR/GBP, EUR/JPY, GBP/JPY, AUD/JPY 他15ペア以上
+- 株価指数: JP225, US30, US500, NAS100, GER40, UK100, FRA40, AUS200, HK50
+- コモディティ: XAUUSD（金）, XAGUSD（銀）, USOIL（WTI）, UKOIL（ブレント）
+- 銘柄マッピングとpipサイズは `src/tools/forex/api.ts` で定義
 
-## Version & Release
+## 環境変数
 
-- Version format: CalVer `YYYY.M.D` (no zero-padding). Tag prefix: `v`.
-- Release script: `bash scripts/release.sh [version]` (defaults to today's date).
-- Release flow: bump version in `package.json`, create git tag, push tag, create GitHub release via `gh`.
-- Do not push or publish without user confirmation.
+- LLMキー: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `MOONSHOT_API_KEY`, `DEEPSEEK_API_KEY`
+- Ollama: `OLLAMA_BASE_URL`（デフォルト `http://127.0.0.1:11434`）
+- 市場データ: `TWELVE_DATA_API_KEY`（価格、指標、経済カレンダー）
+- 検索: `EXASEARCH_API_KEY`（優先）, `PERPLEXITY_API_KEY`, `TAVILY_API_KEY`（フォールバック）
+- トレース: `LANGSMITH_API_KEY`, `LANGSMITH_ENDPOINT`, `LANGSMITH_PROJECT`, `LANGSMITH_TRACING`
+- `.env`ファイルや実際のAPIキーを絶対にコミットしない。
 
-## Testing
+## バージョンとリリース
 
-- Framework: Bun's built-in test runner (primary), Jest config exists for legacy compatibility.
-- Tests colocated as `*.test.ts`.
-- Run `bun test` before pushing when you touch logic.
+- バージョン形式: CalVer `YYYY.M.D`（ゼロパディングなし）。タグプレフィックス: `v`。
+- リリーススクリプト: `bash scripts/release.sh [version]`（デフォルトは今日の日付）。
+- リリースフロー: `package.json`のバージョンバンプ → gitタグ作成 → タグプッシュ → `gh`でGitHubリリース作成。
+- ユーザー確認なしにプッシュ・公開しない。
 
-## Security
+## テスト
 
-- API keys stored in `.env` (gitignored). Users can also enter keys interactively via the CLI.
-- Config stored in `.dexter/settings.json` (gitignored).
-- Never commit or expose real API keys, tokens, or credentials.
+- フレームワーク: Bunビルトインテストランナー（プライマリ）、Jestコンフィグはレガシー互換のために存在。
+- テストは `*.test.ts` としてソースと同じ場所に配置。
+- ロジックを変更したらプッシュ前に `bun test` を実行。
+
+## セキュリティ
+
+- APIキーは `.env`（gitignore済み）に保存。ユーザーはCLIでインタラクティブにキーを入力することも可能。
+- 設定は `.sapiens/settings.json`（gitignore済み）に保存。
+- トレードジャーナルは `.sapiens/journal/`（gitignore済み）に保存。
+- 実際のAPIキー、トークン、資格情報を絶対に公開・コミットしない。

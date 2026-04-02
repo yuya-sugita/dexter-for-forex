@@ -1,11 +1,11 @@
 {
-  "name": "dexter-ts",
-  "version": "2026.3.25",
-  "description": "Dexter - AI agent for deep financial research.",
+  "name": "sapiens",
+  "version": "2026.3.30",
+  "description": "Sapiens - AI agent for FX, indices & gold trade analysis optimized for Fintokei.",
   "type": "module",
   "main": "src/index.tsx",
   "bin": {
-    "dexter-ts": "./src/index.tsx"
+    "sapiens": "./src/index.tsx"
   },
   "scripts": {
     "start": "bun run src/index.tsx",
