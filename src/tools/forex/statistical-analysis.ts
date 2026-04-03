@@ -579,3 +579,395 @@ export const getVolatilityRegime = new DynamicStructuredTool({
     }, []);
   },
 });
+
+// ============================================================================
+// Tool: Cointegration Test (Engle-Granger)
+// ============================================================================
+
+const CointegrationInputSchema = z.object({
+  symbolA: z.string().describe('First instrument symbol (e.g., EUR/USD)'),
+  symbolB: z.string().describe('Second instrument symbol (e.g., GBP/USD)'),
+  interval: z.enum(['1h', '4h', '1day', '1week']).default('1day').describe('Timeframe'),
+  lookback: z.number().default(252).describe('Lookback period'),
+});
+
+/**
+ * Simple OLS regression: y = alpha + beta * x
+ */
+function ols(x: number[], y: number[]): { alpha: number; beta: number; residuals: number[] } {
+  const n = Math.min(x.length, y.length);
+  const mx = mean(x.slice(0, n));
+  const my = mean(y.slice(0, n));
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (x[i] - mx) * (y[i] - my);
+    den += (x[i] - mx) ** 2;
+  }
+  const beta = den === 0 ? 0 : num / den;
+  const alpha = my - beta * mx;
+  const residuals = y.slice(0, n).map((yi, i) => yi - alpha - beta * x[i]);
+  return { alpha, beta, residuals };
+}
+
+/**
+ * Augmented Dickey-Fuller t-statistic (simplified).
+ * Tests H0: unit root exists (non-stationary).
+ */
+function adfTStat(series: number[]): number {
+  const n = series.length;
+  if (n < 10) return 0;
+  // First difference
+  const dy: number[] = [];
+  const yLag: number[] = [];
+  for (let i = 1; i < n; i++) {
+    dy.push(series[i] - series[i - 1]);
+    yLag.push(series[i - 1]);
+  }
+  // OLS: dy = gamma * yLag + error
+  const m = dy.length;
+  const myLag = mean(yLag);
+  const mdy = mean(dy);
+  let numGamma = 0, denGamma = 0;
+  for (let i = 0; i < m; i++) {
+    numGamma += (yLag[i] - myLag) * (dy[i] - mdy);
+    denGamma += (yLag[i] - myLag) ** 2;
+  }
+  const gamma = denGamma === 0 ? 0 : numGamma / denGamma;
+  // Standard error of gamma
+  const resid = dy.map((d, i) => d - mdy - gamma * (yLag[i] - myLag));
+  const sse = resid.reduce((s, r) => s + r * r, 0);
+  const sigmaSquared = sse / (m - 2);
+  const seGamma = denGamma === 0 ? 1 : Math.sqrt(sigmaSquared / denGamma);
+  return seGamma === 0 ? 0 : gamma / seGamma;
+}
+
+export const getCointegration = new DynamicStructuredTool({
+  name: 'get_cointegration',
+  description: 'Engle-Granger cointegration test between two instruments. Tests whether a stable long-run equilibrium exists (useful for pairs trading / spread trading). Returns hedge ratio, spread z-score, half-life of mean reversion, and ADF test statistic.',
+  schema: CointegrationInputSchema,
+  func: async (input, _runManager, config?: RunnableConfig) => {
+    const onProgress = config?.metadata?.onProgress as ((msg: string) => void) | undefined;
+    onProgress?.(`Testing cointegration: ${input.symbolA} vs ${input.symbolB}...`);
+
+    const [dataA, dataB] = await Promise.all([
+      fetchCloses(input.symbolA, input.interval, input.lookback + 1),
+      fetchCloses(input.symbolB, input.interval, input.lookback + 1),
+    ]);
+
+    const n = Math.min(dataA.closes.length, dataB.closes.length);
+    if (n < 60) {
+      return formatToolResult({ error: 'Insufficient data (need at least 60 periods)' }, []);
+    }
+
+    const x = dataA.closes.slice(-n);
+    const y = dataB.closes.slice(-n);
+
+    // Step 1: OLS regression to find hedge ratio
+    const { alpha, beta, residuals } = ols(x, y);
+
+    // Step 2: ADF test on residuals
+    const adfStat = adfTStat(residuals);
+    // Critical values for Engle-Granger (approximate, n > 100)
+    const critical1 = -3.90;
+    const critical5 = -3.34;
+    const critical10 = -3.04;
+    const isCointegrated = adfStat < critical5;
+
+    // Step 3: Current spread z-score
+    const spreadMean = mean(residuals);
+    const spreadStd = stdDev(residuals);
+    const currentSpread = residuals[residuals.length - 1];
+    const spreadZScore = spreadStd > 0 ? (currentSpread - spreadMean) / spreadStd : 0;
+
+    // Step 4: Half-life of mean reversion (from AR(1) on spread)
+    const spreadLag: number[] = [];
+    const spreadDiff: number[] = [];
+    for (let i = 1; i < residuals.length; i++) {
+      spreadLag.push(residuals[i - 1]);
+      spreadDiff.push(residuals[i] - residuals[i - 1]);
+    }
+    const { beta: phi } = ols(spreadLag, spreadDiff);
+    const halfLife = phi < 0 ? -Math.log(2) / Math.log(1 + phi) : Infinity;
+
+    // Step 5: Rolling spread z-scores (last 20)
+    const rollingSpreadZ: Array<{ date: string; zscore: number }> = [];
+    const window = 60;
+    for (let i = Math.max(window, residuals.length - 20); i < residuals.length; i++) {
+      const w = residuals.slice(Math.max(0, i - window), i + 1);
+      const wm = mean(w);
+      const ws = stdDev(w);
+      rollingSpreadZ.push({
+        date: dataA.dates[dataA.dates.length - residuals.length + i] || '',
+        zscore: Math.round((ws > 0 ? (residuals[i] - wm) / ws : 0) * 1000) / 1000,
+      });
+    }
+
+    // Correlation for reference
+    const corr = correlation(logReturns(x), logReturns(y));
+
+    return formatToolResult({
+      pairA: input.symbolA.toUpperCase(),
+      pairB: input.symbolB.toUpperCase(),
+      interval: input.interval,
+      sampleSize: n,
+      hedgeRatio: {
+        beta: Math.round(beta * 10000) / 10000,
+        alpha: Math.round(alpha * 10000) / 10000,
+        interpretation: `1 unit of ${input.symbolB.toUpperCase()} ≈ ${beta.toFixed(4)} units of ${input.symbolA.toUpperCase()} + ${alpha.toFixed(4)}`,
+      },
+      adfTest: {
+        statistic: Math.round(adfStat * 1000) / 1000,
+        critical1pct: critical1,
+        critical5pct: critical5,
+        critical10pct: critical10,
+        isCointegrated,
+        significance: adfStat < critical1 ? '1%' : adfStat < critical5 ? '5%' : adfStat < critical10 ? '10%' : 'NOT_SIGNIFICANT',
+      },
+      spread: {
+        currentZScore: Math.round(spreadZScore * 1000) / 1000,
+        mean: Math.round(spreadMean * 100000) / 100000,
+        stdDev: Math.round(spreadStd * 100000) / 100000,
+        halfLifePeriods: halfLife === Infinity ? 'NO_MEAN_REVERSION' : Math.round(halfLife * 10) / 10,
+        rollingZScores: rollingSpreadZ,
+      },
+      returnCorrelation: Math.round(corr * 1000) / 1000,
+      tradingSignal: !isCointegrated
+        ? 'NO_TRADE: Pair is NOT cointegrated. Spread trading is not statistically supported.'
+        : Math.abs(spreadZScore) > 2.0
+          ? `ENTRY: Spread z-score = ${spreadZScore.toFixed(2)}. ${spreadZScore > 0 ? `Short ${input.symbolB.toUpperCase()}, Long ${input.symbolA.toUpperCase()}` : `Long ${input.symbolB.toUpperCase()}, Short ${input.symbolA.toUpperCase()}`} (hedge ratio: ${beta.toFixed(4)})`
+          : Math.abs(spreadZScore) < 0.5
+            ? 'NEUTRAL: Spread near equilibrium. Wait for divergence.'
+            : `WATCH: Spread z-score = ${spreadZScore.toFixed(2)}. Approaching entry zone.`,
+    }, []);
+  },
+});
+
+// ============================================================================
+// Tool: Drawdown Analysis
+// ============================================================================
+
+const DrawdownInputSchema = z.object({
+  symbol: z.string().describe('Instrument symbol'),
+  interval: z.enum(['1h', '4h', '1day', '1week']).default('1day').describe('Timeframe'),
+  lookback: z.number().default(504).describe('Lookback period (504 ≈ 2 years daily)'),
+});
+
+export const getDrawdownAnalysis = new DynamicStructuredTool({
+  name: 'get_drawdown_analysis',
+  description: 'Detailed drawdown analysis: max drawdown, average drawdown, recovery time distribution, underwater periods, drawdown frequency by severity, and current drawdown status. Critical for Fintokei DD limit management.',
+  schema: DrawdownInputSchema,
+  func: async (input) => {
+    const { closes, dates } = await fetchCloses(input.symbol, input.interval, input.lookback + 1);
+    if (closes.length < 60) {
+      return formatToolResult({ error: 'Insufficient data (need at least 60 periods)' }, []);
+    }
+
+    // Compute drawdown series
+    interface DrawdownEvent {
+      startDate: string;
+      troughDate: string;
+      endDate: string | null;
+      depth: number;
+      duration: number;
+      recoveryTime: number | null;
+    }
+
+    let peak = closes[0];
+    let peakIdx = 0;
+    const ddSeries: number[] = [];
+    const events: DrawdownEvent[] = [];
+    let currentEvent: { startIdx: number; troughIdx: number; troughDD: number } | null = null;
+
+    for (let i = 0; i < closes.length; i++) {
+      if (closes[i] >= peak) {
+        peak = closes[i];
+        peakIdx = i;
+        if (currentEvent && currentEvent.troughDD > 0.01) {
+          events.push({
+            startDate: dates[currentEvent.startIdx],
+            troughDate: dates[currentEvent.troughIdx],
+            endDate: dates[i],
+            depth: currentEvent.troughDD,
+            duration: currentEvent.troughIdx - currentEvent.startIdx,
+            recoveryTime: i - currentEvent.troughIdx,
+          });
+        }
+        currentEvent = null;
+      }
+      const dd = (peak - closes[i]) / peak;
+      ddSeries.push(dd);
+      if (dd > 0.001) {
+        if (!currentEvent) {
+          currentEvent = { startIdx: peakIdx, troughIdx: i, troughDD: dd };
+        } else if (dd > currentEvent.troughDD) {
+          currentEvent.troughIdx = i;
+          currentEvent.troughDD = dd;
+        }
+      }
+    }
+
+    // Current drawdown (if still in one)
+    const currentDD = ddSeries[ddSeries.length - 1];
+    const isInDrawdown = currentDD > 0.001;
+
+    if (currentEvent && isInDrawdown) {
+      events.push({
+        startDate: dates[currentEvent.startIdx],
+        troughDate: dates[currentEvent.troughIdx],
+        endDate: null,
+        depth: currentEvent.troughDD,
+        duration: currentEvent.troughIdx - currentEvent.startIdx,
+        recoveryTime: null,
+      });
+    }
+
+    // Sort by depth
+    const sortedEvents = [...events].sort((a, b) => b.depth - a.depth);
+
+    // Drawdown statistics
+    const allDepths = events.filter(e => e.depth > 0.01).map(e => e.depth);
+    const allDurations = events.filter(e => e.duration > 0).map(e => e.duration);
+    const allRecoveries = events.filter(e => e.recoveryTime !== null).map(e => e.recoveryTime!);
+
+    // Frequency by severity
+    const severity = {
+      mild: allDepths.filter(d => d <= 0.03).length,       // < 3%
+      moderate: allDepths.filter(d => d > 0.03 && d <= 0.05).length,  // 3-5%
+      severe: allDepths.filter(d => d > 0.05 && d <= 0.10).length,   // 5-10%
+      extreme: allDepths.filter(d => d > 0.10).length,     // > 10%
+    };
+
+    return formatToolResult({
+      instrument: input.symbol.toUpperCase(),
+      interval: input.interval,
+      sampleSize: closes.length,
+      currentStatus: {
+        inDrawdown: isInDrawdown,
+        currentDrawdown: `${(currentDD * 100).toFixed(2)}%`,
+        periodsFromPeak: isInDrawdown ? closes.length - 1 - ddSeries.lastIndexOf(0) : 0,
+      },
+      summary: {
+        maxDrawdown: allDepths.length > 0 ? `${(Math.max(...allDepths) * 100).toFixed(2)}%` : '0%',
+        avgDrawdown: allDepths.length > 0 ? `${(mean(allDepths) * 100).toFixed(2)}%` : '0%',
+        medianDrawdown: allDepths.length > 0 ? `${(percentile(allDepths, 50) * 100).toFixed(2)}%` : '0%',
+        totalEvents: allDepths.length,
+        avgDuration: allDurations.length > 0 ? `${mean(allDurations).toFixed(1)} periods` : 'N/A',
+        avgRecoveryTime: allRecoveries.length > 0 ? `${mean(allRecoveries).toFixed(1)} periods` : 'N/A',
+        medianRecoveryTime: allRecoveries.length > 0 ? `${percentile(allRecoveries, 50).toFixed(1)} periods` : 'N/A',
+        longestRecovery: allRecoveries.length > 0 ? `${Math.max(...allRecoveries)} periods` : 'N/A',
+      },
+      frequencyBySeverity: {
+        mild_under3pct: severity.mild,
+        moderate_3to5pct: severity.moderate,
+        severe_5to10pct: severity.severe,
+        extreme_over10pct: severity.extreme,
+      },
+      worstDrawdowns: sortedEvents.slice(0, 5).map(e => ({
+        depth: `${(e.depth * 100).toFixed(2)}%`,
+        startDate: e.startDate,
+        troughDate: e.troughDate,
+        endDate: e.endDate ?? 'ONGOING',
+        durationToPeak: `${e.duration} periods`,
+        recoveryTime: e.recoveryTime !== null ? `${e.recoveryTime} periods` : 'ONGOING',
+      })),
+      fintokeiImplication: {
+        dd5pctProb: allDepths.length > 0 ? `${(allDepths.filter(d => d >= 0.05).length / allDepths.length * 100).toFixed(1)}%` : 'N/A',
+        dd10pctProb: allDepths.length > 0 ? `${(allDepths.filter(d => d >= 0.10).length / allDepths.length * 100).toFixed(1)}%` : 'N/A',
+        recommendation: currentDD > 0.05 ? 'WARNING: Currently in significant drawdown. Consider reducing exposure.'
+          : currentDD > 0.03 ? 'CAUTION: Moderate drawdown in progress. Monitor closely.'
+          : 'Normal conditions for position entry.',
+      },
+    }, []);
+  },
+});
+
+// ============================================================================
+// Tool: Rolling Sharpe Ratio
+// ============================================================================
+
+const RollingSharpeInputSchema = z.object({
+  symbol: z.string().describe('Instrument symbol'),
+  interval: z.enum(['1h', '4h', '1day', '1week']).default('1day').describe('Timeframe'),
+  lookback: z.number().default(504).describe('Total lookback period'),
+  window: z.number().default(60).describe('Rolling window size for Sharpe calculation'),
+});
+
+export const getRollingSharpe = new DynamicStructuredTool({
+  name: 'get_rolling_sharpe',
+  description: 'Compute rolling Sharpe ratio over time for an instrument. Shows how risk-adjusted returns evolve, detects regime shifts, and identifies periods of strategy decay vs improvement. Includes Sharpe percentile rank and trend analysis.',
+  schema: RollingSharpeInputSchema,
+  func: async (input) => {
+    const { closes, dates } = await fetchCloses(input.symbol, input.interval, input.lookback + 1);
+    if (closes.length < input.window + 20) {
+      return formatToolResult({ error: `Insufficient data (need at least ${input.window + 20} periods)` }, []);
+    }
+
+    const returns = logReturns(closes);
+
+    // Annualization factor
+    const annFactor = input.interval === '1day' ? 252 : input.interval === '1week' ? 52 : input.interval === '4h' ? 252 * 6 : 252 * 24;
+
+    // Compute rolling Sharpe
+    const rollingSharpe: Array<{ date: string; sharpe: number }> = [];
+    const sharpeValues: number[] = [];
+
+    for (let i = input.window; i <= returns.length; i++) {
+      const window = returns.slice(i - input.window, i);
+      const m = mean(window);
+      const s = stdDev(window);
+      const sharpe = s > 0 ? (m * Math.sqrt(annFactor)) / (s * Math.sqrt(annFactor / input.window * input.window)) : 0;
+      // Simplified annualized Sharpe = mean / std * sqrt(annFactor)
+      const annSharpe = s > 0 ? (m / s) * Math.sqrt(annFactor) : 0;
+      sharpeValues.push(annSharpe);
+      rollingSharpe.push({
+        date: dates[i], // +1 offset because returns is 1 shorter
+        sharpe: Math.round(annSharpe * 1000) / 1000,
+      });
+    }
+
+    const currentSharpe = sharpeValues[sharpeValues.length - 1];
+    const sharpePercentile = sharpeValues.filter(s => s <= currentSharpe).length / sharpeValues.length * 100;
+
+    // Trend: compare recent vs older Sharpe
+    const recentSharpes = sharpeValues.slice(-Math.floor(sharpeValues.length / 4));
+    const olderSharpes = sharpeValues.slice(0, Math.floor(sharpeValues.length / 4));
+    const recentAvg = mean(recentSharpes);
+    const olderAvg = mean(olderSharpes);
+    const trend = recentAvg > olderAvg + 0.2 ? 'IMPROVING' : recentAvg < olderAvg - 0.2 ? 'DETERIORATING' : 'STABLE';
+
+    // Positive Sharpe periods
+    const positivePeriods = sharpeValues.filter(s => s > 0).length;
+    const positivePct = positivePeriods / sharpeValues.length * 100;
+
+    // Max and min
+    const maxSharpe = Math.max(...sharpeValues);
+    const minSharpe = Math.min(...sharpeValues);
+    const maxIdx = sharpeValues.indexOf(maxSharpe);
+    const minIdx = sharpeValues.indexOf(minSharpe);
+
+    return formatToolResult({
+      instrument: input.symbol.toUpperCase(),
+      interval: input.interval,
+      window: input.window,
+      current: {
+        sharpe: Math.round(currentSharpe * 1000) / 1000,
+        percentile: Math.round(sharpePercentile * 10) / 10,
+        interpretation: currentSharpe > 2.0 ? 'EXCELLENT' : currentSharpe > 1.0 ? 'GOOD' : currentSharpe > 0.5 ? 'MODERATE' : currentSharpe > 0 ? 'WEAK' : 'NEGATIVE',
+      },
+      statistics: {
+        mean: Math.round(mean(sharpeValues) * 1000) / 1000,
+        stdDev: Math.round(stdDev(sharpeValues) * 1000) / 1000,
+        max: { value: Math.round(maxSharpe * 1000) / 1000, date: rollingSharpe[maxIdx]?.date ?? '' },
+        min: { value: Math.round(minSharpe * 1000) / 1000, date: rollingSharpe[minIdx]?.date ?? '' },
+        positivePeriodsPercent: `${positivePct.toFixed(1)}%`,
+      },
+      trend: {
+        direction: trend,
+        recentAvg: Math.round(recentAvg * 1000) / 1000,
+        olderAvg: Math.round(olderAvg * 1000) / 1000,
+      },
+      // Return last 20 data points for visualization
+      history: rollingSharpe.slice(-20),
+    }, []);
+  },
+});

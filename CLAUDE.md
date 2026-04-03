@@ -52,22 +52,31 @@ bun run src/tool-runner.ts skill <skill_name>
 | `get_correlation_matrix` | 2-8銘柄のリターン相関行列 | `symbols` (配列), `interval` |
 | `get_return_distribution` | 歪度/尖度/VaR/CVaR/Hurst/自己相関/JB検定 | `symbol`, `interval`, `lookback` |
 | `get_volatility_regime` | ボラティリティレジーム(LOW/NORMAL/HIGH/CRISIS) | `symbol`, `interval` |
+| `get_cointegration` | Engle-Granger共和分検定（ペアトレード用） | `symbolA`, `symbolB`, `interval` |
+| `get_drawdown_analysis` | ドローダウン分析（最大DD/回復時間/頻度分布） | `symbol`, `interval`, `lookback` |
+| `get_rolling_sharpe` | ローリングシャープレシオの推移 | `symbol`, `interval`, `lookback`, `window` |
 
 ### マクロ・計量経済分析
 
 | ツール | 説明 | 必須引数 |
 |--------|------|----------|
-| `get_rate_differential` | 金利差・政策ダイバージェンス | `pair` (例: "EUR/USD") |
+| `get_rate_differential` | 金利差・政策ダイバージェンス | `baseCurrency`, `quoteCurrency` |
 | `get_macro_regime` | GDP/PMI/CPI/失業率からのマクロレジーム | `country` (例: "US", "JP") |
-| `get_cross_asset_regime` | クロスアセットリスクオン/オフ検出 | (引数なし or `interval`) |
+| `get_cross_asset_regime` | クロスアセットリスクオン/オフ検出 | (引数なし) |
+| `get_yield_curve` | イールドカーブ分析（逆転検出/スプレッド） | `country` ("US"/"GB"/"JP"/"EU") |
+| `get_macro_divergence` | 2経済圏のマクロ乖離スコア（FX方向性） | `baseCurrency`, `quoteCurrency` |
+| `get_seasonal_pattern` | 月別/四半期別の季節性パターン | `symbol`, `yearsBack` |
 
 ### クオンツ戦略
 
 | ツール | 説明 | 必須引数 |
 |--------|------|----------|
 | `backtest_strategy` | 戦略バックテスト(SMA/z-score/RSI/Bollinger/Donchian) | `symbol`, `strategy`, `interval` |
-| `monte_carlo_simulation` | Fintokeiチャレンジのモンテカルロシミュレーション | `win_rate`, `avg_win`, `avg_loss`, `trades_per_day` 等 |
+| `monte_carlo_simulation` | Fintokeiチャレンジのモンテカルロシミュレーション | `winRate`, `avgWinPct`, `avgLossPct`, `tradesPerDay` 等 |
 | `calculate_expected_value` | 確率加重シナリオの期待値 | `scenarios` 配列 |
+| `walk_forward_test` | ウォークフォワード分析（アウトオブサンプル検証） | `symbol`, `strategy`, `interval`, `numFolds` |
+| `calculate_risk_of_ruin` | 破産確率の解析計算+MC検証 | `winRate`, `avgWinPct`, `avgLossPct`, `ruinThresholdPct` |
+| `compare_strategies` | 複数戦略の同一銘柄比較ランキング | `symbol`, `strategies` (配列), `interval` |
 
 ### 経済カレンダー
 
@@ -140,7 +149,31 @@ bun run src/tool-runner.ts call get_return_distribution '{"symbol":"USD/JPY","in
 bun run src/tool-runner.ts call get_economic_calendar '{"importance":"high"}'
 
 # ゴールドのSMAクロスバックテスト
-bun run src/tool-runner.ts call backtest_strategy '{"symbol":"XAUUSD","strategy":"sma_cross","interval":"1day"}'
+bun run src/tool-runner.ts call backtest_strategy '{"symbol":"XAUUSD","strategy":"sma_crossover","interval":"1day"}'
+
+# EUR/USDとGBP/USDの共和分検定（ペアトレード）
+bun run src/tool-runner.ts call get_cointegration '{"symbolA":"EUR/USD","symbolB":"GBP/USD","interval":"1day"}'
+
+# USD/JPYのドローダウン分析
+bun run src/tool-runner.ts call get_drawdown_analysis '{"symbol":"USD/JPY","interval":"1day","lookback":504}'
+
+# 米国イールドカーブ分析
+bun run src/tool-runner.ts call get_yield_curve '{"country":"US"}'
+
+# EUR vs USDのマクロ乖離スコア
+bun run src/tool-runner.ts call get_macro_divergence '{"baseCurrency":"EU","quoteCurrency":"US"}'
+
+# XAUUSDの季節性パターン
+bun run src/tool-runner.ts call get_seasonal_pattern '{"symbol":"XAUUSD","yearsBack":5}'
+
+# 5戦略の比較ランキング
+bun run src/tool-runner.ts call compare_strategies '{"symbol":"EUR/USD","strategies":["sma_crossover","mean_reversion_zscore","momentum_rsi","bollinger_breakout","donchian_channel"],"interval":"1day"}'
+
+# ウォークフォワード分析（オーバーフィット検出）
+bun run src/tool-runner.ts call walk_forward_test '{"symbol":"EUR/USD","strategy":"mean_reversion_zscore","interval":"1day","numFolds":5}'
+
+# 破産確率計算
+bun run src/tool-runner.ts call calculate_risk_of_ruin '{"winRate":0.55,"avgWinPct":1.5,"avgLossPct":-1.0,"ruinThresholdPct":10}'
 ```
 
 ## Sapiens哲学

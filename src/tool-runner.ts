@@ -24,13 +24,13 @@ import { getPrice, getPriceHistory, listInstruments } from './tools/forex/market
 import { getTechnicalIndicator, getMultiIndicators } from './tools/forex/technical-analysis.js';
 
 // Statistical analysis
-import { getZScore, getCorrelationMatrix, getReturnDistribution, getVolatilityRegime } from './tools/forex/statistical-analysis.js';
+import { getZScore, getCorrelationMatrix, getReturnDistribution, getVolatilityRegime, getCointegration, getDrawdownAnalysis, getRollingSharpe } from './tools/forex/statistical-analysis.js';
 
 // Macro analysis
-import { getRateDifferential, getMacroRegime, getCrossAssetRegime } from './tools/forex/macro-analysis.js';
+import { getRateDifferential, getMacroRegime, getCrossAssetRegime, getYieldCurve, getMacroDivergence, getSeasonalPattern } from './tools/forex/macro-analysis.js';
 
 // Quant strategy
-import { backtestStrategy, monteCarloSimulation, calculateExpectedValue } from './tools/forex/quant-strategy.js';
+import { backtestStrategy, monteCarloSimulation, calculateExpectedValue, walkForwardTest, calculateRiskOfRuin, compareStrategies } from './tools/forex/quant-strategy.js';
 
 // Economic calendar
 import { getEconomicCalendar } from './tools/forex/economic-calendar.js';
@@ -62,16 +62,25 @@ const ALL_TOOLS: StructuredToolInterface[] = [
   getCorrelationMatrix,
   getReturnDistribution,
   getVolatilityRegime,
+  getCointegration,
+  getDrawdownAnalysis,
+  getRollingSharpe,
 
   // Macro Analysis
   getRateDifferential,
   getMacroRegime,
   getCrossAssetRegime,
+  getYieldCurve,
+  getMacroDivergence,
+  getSeasonalPattern,
 
   // Quant Strategy
   backtestStrategy,
   monteCarloSimulation,
   calculateExpectedValue,
+  walkForwardTest,
+  calculateRiskOfRuin,
+  compareStrategies,
 
   // Economic Calendar
   getEconomicCalendar,

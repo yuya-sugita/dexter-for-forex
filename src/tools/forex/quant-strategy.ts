@@ -506,3 +506,472 @@ export const calculateExpectedValue = new DynamicStructuredTool({
     }, []);
   },
 });
+
+// ============================================================================
+// Tool: Walk-Forward Analysis
+// ============================================================================
+
+const WalkForwardInputSchema = z.object({
+  symbol: z.string().describe('Instrument symbol'),
+  interval: z.enum(['1h', '4h', '1day']).default('1day'),
+  lookback: z.number().default(1000).describe('Total data points (needs to be large for walk-forward)'),
+  strategy: z.enum([
+    'sma_crossover',
+    'mean_reversion_zscore',
+    'momentum_rsi',
+    'bollinger_breakout',
+    'donchian_channel',
+  ]).describe('Strategy to test'),
+  trainPct: z.number().default(70).describe('Training set percentage (e.g., 70 for 70/30 split)'),
+  numFolds: z.number().default(5).describe('Number of walk-forward folds (default 5)'),
+});
+
+export const walkForwardTest = new DynamicStructuredTool({
+  name: 'walk_forward_test',
+  description: 'Walk-forward analysis: splits data into train/test folds to validate strategy robustness out-of-sample. Unlike simple backtesting, this prevents overfitting by testing on unseen data. Returns in-sample vs out-of-sample Sharpe, degradation ratio, and fold-by-fold results.',
+  schema: WalkForwardInputSchema,
+  func: async (input, _runManager, config?: RunnableConfig) => {
+    const onProgress = config?.metadata?.onProgress as ((msg: string) => void) | undefined;
+    onProgress?.(`Running walk-forward analysis on ${input.symbol} (${input.numFolds} folds)...`);
+
+    const closes = await fetchCloses(input.symbol, input.interval, input.lookback);
+    if (closes.length < 200) {
+      return formatToolResult({ error: 'Insufficient data for walk-forward (need at least 200 candles)' }, []);
+    }
+
+    const foldSize = Math.floor(closes.length / input.numFolds);
+    const trainSize = Math.floor(foldSize * (input.trainPct / 100));
+    const testSize = foldSize - trainSize;
+
+    if (trainSize < 50 || testSize < 20) {
+      return formatToolResult({ error: 'Fold sizes too small. Increase lookback or reduce numFolds.' }, []);
+    }
+
+    function runStrategyOnSegment(segment: number[]): { pnls: number[]; trades: number } {
+      const pnls: number[] = [];
+      const p = { fast_period: 10, slow_period: 30, zscore_threshold: 2.0, rsi_period: 14, rsi_overbought: 70, rsi_oversold: 30, bb_period: 20, bb_std: 2.0, channel_period: 20 };
+
+      // Generate signals
+      const signals: Array<{ index: number; direction: 'long' | 'short' }> = [];
+
+      switch (input.strategy) {
+        case 'sma_crossover': {
+          for (let i = p.slow_period; i < segment.length; i++) {
+            const fastMA = mean(segment.slice(i - p.fast_period, i));
+            const slowMA = mean(segment.slice(i - p.slow_period, i));
+            const prevFast = mean(segment.slice(i - p.fast_period - 1, i - 1));
+            const prevSlow = mean(segment.slice(i - p.slow_period - 1, i - 1));
+            if (prevFast <= prevSlow && fastMA > slowMA) signals.push({ index: i, direction: 'long' });
+            if (prevFast >= prevSlow && fastMA < slowMA) signals.push({ index: i, direction: 'short' });
+          }
+          break;
+        }
+        case 'mean_reversion_zscore': {
+          for (let i = p.slow_period; i < segment.length; i++) {
+            const w = segment.slice(i - p.slow_period, i);
+            const m = mean(w);
+            const s = stdDev(w);
+            if (s === 0) continue;
+            const z = (segment[i] - m) / s;
+            if (z < -p.zscore_threshold) signals.push({ index: i, direction: 'long' });
+            if (z > p.zscore_threshold) signals.push({ index: i, direction: 'short' });
+          }
+          break;
+        }
+        case 'momentum_rsi': {
+          for (let i = p.rsi_period + 1; i < segment.length; i++) {
+            const changes = segment.slice(i - p.rsi_period, i).map((c, j, arr) => j > 0 ? c - arr[j - 1] : 0).slice(1);
+            const gains = changes.filter(c => c > 0);
+            const losses = changes.filter(c => c < 0).map(Math.abs);
+            const avgGain = gains.length > 0 ? mean(gains) : 0.0001;
+            const avgLoss = losses.length > 0 ? mean(losses) : 0.0001;
+            const rsi = 100 - 100 / (1 + avgGain / avgLoss);
+            if (rsi < p.rsi_oversold) signals.push({ index: i, direction: 'long' });
+            if (rsi > p.rsi_overbought) signals.push({ index: i, direction: 'short' });
+          }
+          break;
+        }
+        case 'bollinger_breakout': {
+          for (let i = p.bb_period; i < segment.length; i++) {
+            const w = segment.slice(i - p.bb_period, i);
+            const m = mean(w);
+            const s = stdDev(w);
+            if (segment[i] > m + p.bb_std * s) signals.push({ index: i, direction: 'long' });
+            if (segment[i] < m - p.bb_std * s) signals.push({ index: i, direction: 'short' });
+          }
+          break;
+        }
+        case 'donchian_channel': {
+          for (let i = p.channel_period; i < segment.length; i++) {
+            const w = segment.slice(i - p.channel_period, i);
+            if (segment[i] > Math.max(...w)) signals.push({ index: i, direction: 'long' });
+            if (segment[i] < Math.min(...w)) signals.push({ index: i, direction: 'short' });
+          }
+          break;
+        }
+      }
+
+      // Simple fixed-bar exit (hold for 5 bars)
+      for (const sig of signals) {
+        const exitIdx = Math.min(sig.index + 5, segment.length - 1);
+        if (exitIdx <= sig.index) continue;
+        const pnl = sig.direction === 'long'
+          ? (segment[exitIdx] - segment[sig.index]) / segment[sig.index] * 100
+          : (segment[sig.index] - segment[exitIdx]) / segment[sig.index] * 100;
+        pnls.push(pnl);
+      }
+
+      return { pnls, trades: pnls.length };
+    }
+
+    interface FoldResult {
+      fold: number;
+      inSample: { sharpe: number; trades: number; winRate: number; avgReturn: number };
+      outOfSample: { sharpe: number; trades: number; winRate: number; avgReturn: number };
+      degradation: number;
+    }
+
+    const folds: FoldResult[] = [];
+
+    for (let f = 0; f < input.numFolds; f++) {
+      const startIdx = f * foldSize;
+      const trainEnd = startIdx + trainSize;
+      const testEnd = Math.min(trainEnd + testSize, closes.length);
+
+      const trainSegment = closes.slice(startIdx, trainEnd);
+      const testSegment = closes.slice(trainEnd, testEnd);
+
+      const trainResult = runStrategyOnSegment(trainSegment);
+      const testResult = runStrategyOnSegment(testSegment);
+
+      function calcMetrics(pnls: number[]) {
+        if (pnls.length < 3) return { sharpe: 0, trades: pnls.length, winRate: 0, avgReturn: 0 };
+        const avg = mean(pnls);
+        const sd = stdDev(pnls);
+        return {
+          sharpe: sd > 0 ? Math.round((avg / sd) * 1000) / 1000 : 0,
+          trades: pnls.length,
+          winRate: Math.round(pnls.filter(p => p > 0).length / pnls.length * 1000) / 10,
+          avgReturn: Math.round(avg * 1000) / 1000,
+        };
+      }
+
+      const inSample = calcMetrics(trainResult.pnls);
+      const outOfSample = calcMetrics(testResult.pnls);
+      const degradation = inSample.sharpe > 0 ? Math.round((1 - outOfSample.sharpe / inSample.sharpe) * 1000) / 10 : 0;
+
+      folds.push({ fold: f + 1, inSample, outOfSample, degradation });
+    }
+
+    // Aggregate
+    const avgISsharpe = mean(folds.map(f => f.inSample.sharpe));
+    const avgOOSsharpe = mean(folds.map(f => f.outOfSample.sharpe));
+    const avgDegradation = avgISsharpe > 0 ? (1 - avgOOSsharpe / avgISsharpe) * 100 : 0;
+    const oosPositive = folds.filter(f => f.outOfSample.sharpe > 0).length;
+
+    return formatToolResult({
+      instrument: input.symbol.toUpperCase(),
+      strategy: input.strategy,
+      interval: input.interval,
+      totalDataPoints: closes.length,
+      foldConfig: { numFolds: input.numFolds, trainSize, testSize, trainPct: input.trainPct },
+      aggregate: {
+        avgInSampleSharpe: Math.round(avgISsharpe * 1000) / 1000,
+        avgOutOfSampleSharpe: Math.round(avgOOSsharpe * 1000) / 1000,
+        degradationPct: `${avgDegradation.toFixed(1)}%`,
+        oosPositiveFolds: `${oosPositive}/${input.numFolds}`,
+        isRobust: avgOOSsharpe > 0 && avgDegradation < 50 && oosPositive >= Math.ceil(input.numFolds / 2),
+      },
+      folds,
+      assessment: avgOOSsharpe > 0.3 && avgDegradation < 30
+        ? `ROBUST: Strategy performs well out-of-sample (OOS Sharpe: ${avgOOSsharpe.toFixed(2)}, degradation: ${avgDegradation.toFixed(0)}%). Low overfitting risk.`
+        : avgOOSsharpe > 0 && avgDegradation < 60
+          ? `MODERATE: Strategy shows some OOS edge but significant in-sample degradation (${avgDegradation.toFixed(0)}%). Consider parameter simplification.`
+          : `OVERFIT: Strategy fails out-of-sample (OOS Sharpe: ${avgOOSsharpe.toFixed(2)}, degradation: ${avgDegradation.toFixed(0)}%). Likely curve-fitted to historical data.`,
+    }, []);
+  },
+});
+
+// ============================================================================
+// Tool: Risk of Ruin Calculator
+// ============================================================================
+
+const RiskOfRuinInputSchema = z.object({
+  winRate: z.number().min(0.01).max(0.99).describe('Win rate as decimal (e.g., 0.55)'),
+  avgWinPct: z.number().describe('Average win as % of account (e.g., 1.5)'),
+  avgLossPct: z.number().describe('Average loss as % of account (negative, e.g., -1.0)'),
+  ruinThresholdPct: z.number().default(10).describe('Account loss % that constitutes ruin (Fintokei: 10)'),
+  maxConcurrentTrades: z.number().default(1).describe('Max concurrent trades (correlation adjustment)'),
+});
+
+export const calculateRiskOfRuin = new DynamicStructuredTool({
+  name: 'calculate_risk_of_ruin',
+  description: 'Calculate the analytical probability of ruin (hitting max drawdown) given trading statistics. Uses both the classic formula and Monte Carlo validation. Essential for Fintokei DD limit management — shows P(hitting 5% daily loss or 10% total DD).',
+  schema: RiskOfRuinInputSchema,
+  func: async (input) => {
+    const { winRate, avgWinPct, avgLossPct, ruinThresholdPct, maxConcurrentTrades } = input;
+    const avgLossAbs = Math.abs(avgLossPct);
+
+    // Expected value per trade
+    const ev = winRate * avgWinPct + (1 - winRate) * avgLossPct;
+
+    // Edge ratio
+    const edgeRatio = avgLossAbs > 0 ? avgWinPct / avgLossAbs : 0;
+
+    // Classic Risk of Ruin formula: ((1-p)/p)^(U/unit)
+    // where p = adjusted probability, U = max drawdown
+    // This is the gambler's ruin with unequal bets
+    const q = 1 - winRate;
+    let analyticalRoR: number;
+
+    if (ev <= 0) {
+      analyticalRoR = 1.0; // Negative EV = certain ruin eventually
+    } else {
+      // Approximate: RoR ≈ ((q/p) * (avgLoss/avgWin))^N where N = ruinThreshold/avgLoss
+      const ratio = (q * avgLossAbs) / (winRate * avgWinPct);
+      const n = ruinThresholdPct / avgLossAbs;
+      analyticalRoR = Math.min(1.0, Math.pow(ratio, n));
+    }
+
+    // Adjust for concurrent trades (simplified correlation impact)
+    const concurrencyMultiplier = 1 + (maxConcurrentTrades - 1) * 0.3;
+    const adjustedRoR = Math.min(1.0, analyticalRoR * concurrencyMultiplier);
+
+    // Monte Carlo validation (5000 paths)
+    const simulations = 5000;
+    const maxTrades = 1000;
+    let ruinCount = 0;
+    const peakToTroughDDs: number[] = [];
+
+    for (let sim = 0; sim < simulations; sim++) {
+      let equity = 100;
+      let peak = 100;
+      let maxDD = 0;
+      let ruined = false;
+
+      for (let t = 0; t < maxTrades && !ruined; t++) {
+        const isWin = Math.random() < winRate;
+        const pnl = isWin ? equity * (avgWinPct / 100) : equity * (avgLossPct / 100);
+        equity += pnl;
+
+        if (equity > peak) peak = equity;
+        const dd = (peak - equity) / 100 * 100;
+        if (dd > maxDD) maxDD = dd;
+
+        if (dd >= ruinThresholdPct) {
+          ruined = true;
+          ruinCount++;
+        }
+      }
+      peakToTroughDDs.push(maxDD);
+    }
+
+    const mcRoR = ruinCount / simulations;
+
+    // Kelly criterion
+    const kelly = avgLossAbs > 0 ? winRate - q / edgeRatio : 0;
+
+    // Optimal risk per trade for Fintokei
+    const safeRiskPerTrade = ev > 0 ? Math.min(kelly * 50, ruinThresholdPct / 20) : 0; // Half-Kelly capped
+
+    return formatToolResult({
+      inputs: {
+        winRate: `${(winRate * 100).toFixed(1)}%`,
+        avgWin: `+${avgWinPct}%`,
+        avgLoss: `${avgLossPct}%`,
+        expectedValuePerTrade: `${ev.toFixed(3)}%`,
+        edgeRatio: edgeRatio.toFixed(2),
+        ruinThreshold: `${ruinThresholdPct}%`,
+        maxConcurrentTrades,
+      },
+      riskOfRuin: {
+        analytical: `${(analyticalRoR * 100).toFixed(2)}%`,
+        adjustedForConcurrency: `${(adjustedRoR * 100).toFixed(2)}%`,
+        monteCarlo: `${(mcRoR * 100).toFixed(1)}% (over ${maxTrades} trades)`,
+        interpretation: adjustedRoR < 0.01
+          ? 'VERY LOW risk of ruin (<1%). Safe for Fintokei challenges.'
+          : adjustedRoR < 0.05
+            ? 'LOW risk of ruin (<5%). Acceptable for challenges with discipline.'
+            : adjustedRoR < 0.15
+              ? 'MODERATE risk of ruin. Consider reducing position size.'
+              : adjustedRoR < 0.30
+                ? 'HIGH risk of ruin. Significantly reduce risk per trade.'
+                : 'VERY HIGH risk of ruin. Strategy is unsuitable for Fintokei challenges.',
+      },
+      drawdownDistribution: {
+        meanMaxDD: `${mean(peakToTroughDDs).toFixed(2)}%`,
+        medianMaxDD: `${percentile(peakToTroughDDs, 50).toFixed(2)}%`,
+        p90MaxDD: `${percentile(peakToTroughDDs, 90).toFixed(2)}%`,
+        p95MaxDD: `${percentile(peakToTroughDDs, 95).toFixed(2)}%`,
+        p99MaxDD: `${percentile(peakToTroughDDs, 99).toFixed(2)}%`,
+      },
+      kellyCriterion: {
+        fullKelly: `${(kelly * 100).toFixed(2)}%`,
+        halfKelly: `${(kelly * 50).toFixed(2)}%`,
+        hasEdge: ev > 0,
+      },
+      recommendation: {
+        optimalRiskPerTrade: `${safeRiskPerTrade.toFixed(2)}%`,
+        maxConcurrentPositions: Math.max(1, Math.floor(ruinThresholdPct / (safeRiskPerTrade * 3))),
+        dailyLossLimit: `${Math.min(5, safeRiskPerTrade * 3).toFixed(1)}% (Fintokei: 5%)`,
+      },
+    }, []);
+  },
+});
+
+// ============================================================================
+// Tool: Multi-Strategy Comparison
+// ============================================================================
+
+const CompareStrategiesInputSchema = z.object({
+  symbol: z.string().describe('Instrument symbol'),
+  interval: z.enum(['1h', '4h', '1day']).default('1day'),
+  lookback: z.number().default(500).describe('Number of candles'),
+  strategies: z.array(z.enum([
+    'sma_crossover',
+    'mean_reversion_zscore',
+    'momentum_rsi',
+    'bollinger_breakout',
+    'donchian_channel',
+  ])).min(2).max(5).describe('Array of strategies to compare'),
+});
+
+export const compareStrategies = new DynamicStructuredTool({
+  name: 'compare_strategies',
+  description: 'Compare multiple trading strategies on the same instrument side-by-side. Returns Sharpe, Sortino, max DD, win rate, profit factor, and overall ranking for each strategy. Helps identify the best approach for current market conditions.',
+  schema: CompareStrategiesInputSchema,
+  func: async (input, _runManager, config?: RunnableConfig) => {
+    const onProgress = config?.metadata?.onProgress as ((msg: string) => void) | undefined;
+    onProgress?.(`Comparing ${input.strategies.length} strategies on ${input.symbol}...`);
+
+    const closes = await fetchCloses(input.symbol, input.interval, input.lookback);
+    if (closes.length < 100) {
+      return formatToolResult({ error: 'Insufficient data (need at least 100 candles)' }, []);
+    }
+
+    function runStrategy(strategyName: string): { pnls: number[]; trades: number } {
+      const pnls: number[] = [];
+      const signals: Array<{ index: number; direction: 'long' | 'short' }> = [];
+
+      switch (strategyName) {
+        case 'sma_crossover': {
+          const fast = 10, slow = 30;
+          for (let i = slow; i < closes.length; i++) {
+            const fastMA = mean(closes.slice(i - fast, i));
+            const slowMA = mean(closes.slice(i - slow, i));
+            const prevFast = mean(closes.slice(i - fast - 1, i - 1));
+            const prevSlow = mean(closes.slice(i - slow - 1, i - 1));
+            if (prevFast <= prevSlow && fastMA > slowMA) signals.push({ index: i, direction: 'long' });
+            if (prevFast >= prevSlow && fastMA < slowMA) signals.push({ index: i, direction: 'short' });
+          }
+          break;
+        }
+        case 'mean_reversion_zscore': {
+          for (let i = 30; i < closes.length; i++) {
+            const w = closes.slice(i - 30, i);
+            const m = mean(w);
+            const s = stdDev(w);
+            if (s === 0) continue;
+            const z = (closes[i] - m) / s;
+            if (z < -2.0) signals.push({ index: i, direction: 'long' });
+            if (z > 2.0) signals.push({ index: i, direction: 'short' });
+          }
+          break;
+        }
+        case 'momentum_rsi': {
+          for (let i = 15; i < closes.length; i++) {
+            const changes = closes.slice(i - 14, i).map((c, j, arr) => j > 0 ? c - arr[j - 1] : 0).slice(1);
+            const gains = changes.filter(c => c > 0);
+            const losses = changes.filter(c => c < 0).map(Math.abs);
+            const avgGain = gains.length > 0 ? mean(gains) : 0.0001;
+            const avgLoss = losses.length > 0 ? mean(losses) : 0.0001;
+            const rsi = 100 - 100 / (1 + avgGain / avgLoss);
+            if (rsi < 30) signals.push({ index: i, direction: 'long' });
+            if (rsi > 70) signals.push({ index: i, direction: 'short' });
+          }
+          break;
+        }
+        case 'bollinger_breakout': {
+          for (let i = 20; i < closes.length; i++) {
+            const w = closes.slice(i - 20, i);
+            const m = mean(w);
+            const s = stdDev(w);
+            if (closes[i] > m + 2 * s) signals.push({ index: i, direction: 'long' });
+            if (closes[i] < m - 2 * s) signals.push({ index: i, direction: 'short' });
+          }
+          break;
+        }
+        case 'donchian_channel': {
+          for (let i = 20; i < closes.length; i++) {
+            const w = closes.slice(i - 20, i);
+            if (closes[i] > Math.max(...w)) signals.push({ index: i, direction: 'long' });
+            if (closes[i] < Math.min(...w)) signals.push({ index: i, direction: 'short' });
+          }
+          break;
+        }
+      }
+
+      // Fixed 5-bar exit
+      for (const sig of signals) {
+        const exitIdx = Math.min(sig.index + 5, closes.length - 1);
+        if (exitIdx <= sig.index) continue;
+        const pnl = sig.direction === 'long'
+          ? (closes[exitIdx] - closes[sig.index]) / closes[sig.index] * 100
+          : (closes[sig.index] - closes[exitIdx]) / closes[sig.index] * 100;
+        pnls.push(pnl);
+      }
+
+      return { pnls, trades: pnls.length };
+    }
+
+    const results = input.strategies.map(strategy => {
+      const { pnls } = runStrategy(strategy);
+      if (pnls.length < 3) return { strategy, trades: pnls.length, error: 'Insufficient trades' };
+
+      const wins = pnls.filter(p => p > 0);
+      const losses = pnls.filter(p => p < 0);
+      const avg = mean(pnls);
+      const sd = stdDev(pnls);
+      const downside = losses.length > 0 ? stdDev(losses) : 0;
+      const profitFactor = losses.length > 0 ? wins.reduce((s, v) => s + v, 0) / Math.abs(losses.reduce((s, v) => s + v, 0)) : Infinity;
+
+      // Max DD
+      let cum = 0, peak = 0, maxDD = 0;
+      for (const p of pnls) { cum += p; if (cum > peak) peak = cum; const dd = peak - cum; if (dd > maxDD) maxDD = dd; }
+
+      return {
+        strategy,
+        trades: pnls.length,
+        winRate: Math.round(wins.length / pnls.length * 1000) / 10,
+        avgReturn: Math.round(avg * 1000) / 1000,
+        totalReturn: Math.round(pnls.reduce((s, v) => s + v, 0) * 100) / 100,
+        sharpe: sd > 0 ? Math.round(avg / sd * 1000) / 1000 : 0,
+        sortino: downside > 0 ? Math.round(avg / downside * 1000) / 1000 : 0,
+        profitFactor: profitFactor === Infinity ? 'Inf' : Math.round(profitFactor * 100) / 100,
+        maxDrawdown: Math.round(maxDD * 100) / 100,
+      };
+    });
+
+    // Rank by Sharpe ratio
+    const ranked = [...results]
+      .filter(r => !('error' in r))
+      .sort((a: any, b: any) => (b.sharpe ?? 0) - (a.sharpe ?? 0));
+
+    return formatToolResult({
+      instrument: input.symbol.toUpperCase(),
+      interval: input.interval,
+      dataPoints: closes.length,
+      comparison: results,
+      ranking: ranked.map((r: any, i: number) => ({
+        rank: i + 1,
+        strategy: r.strategy,
+        sharpe: r.sharpe,
+        winRate: `${r.winRate}%`,
+        totalReturn: `${r.totalReturn}%`,
+      })),
+      recommendation: ranked.length > 0
+        ? `Best strategy: ${(ranked[0] as any).strategy} (Sharpe: ${(ranked[0] as any).sharpe}, Win: ${(ranked[0] as any).winRate}%, Return: ${(ranked[0] as any).totalReturn}%)`
+        : 'Insufficient data to rank strategies',
+    }, []);
+  },
+});
