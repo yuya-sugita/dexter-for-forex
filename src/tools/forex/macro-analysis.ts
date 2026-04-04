@@ -3,7 +3,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import { z } from 'zod';
 import { formatToolResult } from '../types.js';
 import { logger } from '../../utils/logger.js';
-import { rateLimitedFetch } from './api.js';
+import { api, resolveSymbol, rateLimitedFetch } from './api.js';
 
 export const MACRO_ANALYSIS_DESCRIPTION = `
 Econometric macro analysis engine for FX and cross-asset markets. Analyzes leading indicators, rate differentials, yield curves, and macro regime states to provide fundamental context for trading decisions.
@@ -260,6 +260,364 @@ export const getCrossAssetRegime = new DynamicStructuredTool({
         : regime === 'RISK_OFF'
         ? 'Favor: JPY, CHF, gold. Avoid: AUD, NZD, equity index longs.'
         : 'No clear directional bias. Focus on instrument-specific setups.',
+    }, []);
+  },
+});
+
+// ============================================================================
+// Tool: Yield Curve Analysis
+// ============================================================================
+
+const YieldCurveInputSchema = z.object({
+  country: z.enum(['US', 'GB', 'JP', 'EU']).default('US').describe('Country for yield curve analysis'),
+});
+
+export const getYieldCurve = new DynamicStructuredTool({
+  name: 'get_yield_curve',
+  description: 'Analyze the yield curve shape, slope (10Y-2Y spread), and inversion status. Yield curve inversion is one of the most reliable recession indicators. Includes term premium estimation, curve steepness, and FX implications.',
+  schema: YieldCurveInputSchema,
+  func: async (input, _runManager, config?: RunnableConfig) => {
+    const onProgress = config?.metadata?.onProgress as ((msg: string) => void) | undefined;
+    onProgress?.(`Fetching yield curve data for ${input.country}...`);
+
+    const apiKey = getApiKey();
+
+    // Tenor symbols by country
+    const tenorMap: Record<string, Record<string, string>> = {
+      US: { '3M': 'GB:US3M', '2Y': 'GB:US2Y', '5Y': 'GB:US5Y', '10Y': 'GB:US10Y', '30Y': 'GB:US30Y' },
+      GB: { '2Y': 'GB:UK2Y', '10Y': 'GB:UK10Y' },
+      JP: { '2Y': 'GB:JP2Y', '10Y': 'GB:JP10Y' },
+      EU: { '2Y': 'GB:DE2Y', '10Y': 'GB:DE10Y' },
+    };
+
+    const tenors = tenorMap[input.country] || tenorMap.US;
+    const yields: Record<string, number | null> = {};
+
+    // Fetch each tenor
+    for (const [tenor, symbol] of Object.entries(tenors)) {
+      try {
+        const url = new URL('https://api.twelvedata.com/quote');
+        if (apiKey) url.searchParams.append('apikey', apiKey);
+        url.searchParams.append('symbol', symbol);
+        const response = await rateLimitedFetch(url.toString());
+        if (response.ok) {
+          const data = await response.json() as Record<string, unknown>;
+          yields[tenor] = parseFloat(data.close as string) || null;
+        } else {
+          yields[tenor] = null;
+        }
+      } catch {
+        yields[tenor] = null;
+      }
+    }
+
+    const y2 = yields['2Y'];
+    const y10 = yields['10Y'];
+    const y3m = yields['3M'];
+    const y30 = yields['30Y'];
+
+    // 10Y-2Y spread (most watched)
+    const spread10y2y = y10 !== null && y2 !== null ? y10 - y2 : null;
+    // 10Y-3M spread (Fed preferred)
+    const spread10y3m = y10 !== null && y3m !== null ? y10 - y3m : null;
+    // Term premium (30Y-10Y)
+    const termPremium = y30 !== null && y10 !== null ? y30 - y10 : null;
+
+    const isInverted10y2y = spread10y2y !== null && spread10y2y < 0;
+    const isInverted10y3m = spread10y3m !== null && spread10y3m < 0;
+
+    // Curve shape classification
+    let shape: string;
+    if (isInverted10y2y || isInverted10y3m) {
+      shape = 'INVERTED';
+    } else if (spread10y2y !== null && spread10y2y < 0.25) {
+      shape = 'FLAT';
+    } else if (spread10y2y !== null && spread10y2y > 1.5) {
+      shape = 'STEEP';
+    } else {
+      shape = 'NORMAL';
+    }
+
+    const currency = input.country === 'EU' ? 'EUR' : input.country === 'GB' ? 'GBP' : input.country === 'JP' ? 'JPY' : 'USD';
+
+    return formatToolResult({
+      country: input.country,
+      yields: Object.fromEntries(Object.entries(yields).map(([k, v]) => [k, v !== null ? `${v.toFixed(3)}%` : 'N/A'])),
+      spreads: {
+        '10Y_2Y': spread10y2y !== null ? `${(spread10y2y * 100).toFixed(0)} bps` : 'N/A',
+        '10Y_3M': spread10y3m !== null ? `${(spread10y3m * 100).toFixed(0)} bps` : 'N/A',
+        termPremium30Y10Y: termPremium !== null ? `${(termPremium * 100).toFixed(0)} bps` : 'N/A',
+      },
+      curveShape: {
+        classification: shape,
+        isInverted: isInverted10y2y || isInverted10y3m,
+        description: shape === 'INVERTED'
+          ? 'RECESSION WARNING: Yield curve is inverted. Historically precedes recession by 6-18 months. Markets pricing in future rate cuts.'
+          : shape === 'FLAT'
+            ? 'Late-cycle signal. Flat curve indicates market uncertainty about growth trajectory. Watch for inversion.'
+            : shape === 'STEEP'
+              ? 'Early-cycle or recovery signal. Market expects higher growth/inflation ahead. Generally positive for risk assets.'
+              : 'Normal upward sloping curve. No extreme signal.',
+      },
+      fxImplication: {
+        currency,
+        rationale: shape === 'INVERTED'
+          ? `${currency} risk: Curve inversion signals rate cuts ahead → ${currency} bearish medium-term, but initial safe-haven flows may support temporarily`
+          : shape === 'STEEP'
+            ? `${currency} supportive: Steepening curve suggests economic optimism → supports ${currency} via rate expectations`
+            : `${currency} neutral: Normal curve shape provides no directional signal for ${currency}`,
+      },
+    }, []);
+  },
+});
+
+// ============================================================================
+// Tool: Macro Divergence Score
+// ============================================================================
+
+const MacroDivergenceInputSchema = z.object({
+  baseCurrency: z.string().describe('Base currency country (e.g., US, EU, JP, GB, AU, CA, CH, NZ)'),
+  quoteCurrency: z.string().describe('Quote currency country'),
+});
+
+export const getMacroDivergence = new DynamicStructuredTool({
+  name: 'get_macro_divergence',
+  description: 'Compare macro regimes between two economies to assess FX directional bias. Combines GDP, PMI, CPI, employment, and rate differentials into a composite divergence score. Higher divergence = stronger directional FX signal.',
+  schema: MacroDivergenceInputSchema,
+  func: async (input, _runManager, config?: RunnableConfig) => {
+    const onProgress = config?.metadata?.onProgress as ((msg: string) => void) | undefined;
+    onProgress?.(`Comparing macro regimes: ${input.baseCurrency} vs ${input.quoteCurrency}...`);
+
+    const countryNames: Record<string, string> = {
+      US: 'United States', EU: 'Euro Area', JP: 'Japan', GB: 'United Kingdom',
+      AU: 'Australia', CA: 'Canada', CH: 'Switzerland', NZ: 'New Zealand', CN: 'China',
+    };
+
+    const base = input.baseCurrency.toUpperCase();
+    const quote = input.quoteCurrency.toUpperCase();
+    const baseName = countryNames[base] || base;
+    const quoteName = countryNames[quote] || quote;
+
+    // Fetch indicators for both countries
+    const indicators = ['real_gdp', 'cpi', 'unemployment_rate', 'pmi_manufacturing'] as const;
+
+    const [baseData, quoteData] = await Promise.all([
+      Promise.all(indicators.map(ind => fetchEconomicIndicator(ind, baseName, 6))),
+      Promise.all(indicators.map(ind => fetchEconomicIndicator(ind, quoteName, 6))),
+    ]);
+
+    const indicatorLabels = ['GDP Growth', 'CPI Inflation', 'Unemployment', 'PMI Manufacturing'];
+    const comparison: Array<{
+      indicator: string;
+      base: { latest: number | null; trend: string };
+      quote: { latest: number | null; trend: string };
+      divergence: number;
+      favorsCurrency: string;
+    }> = [];
+
+    let compositeScore = 0;
+    let validCount = 0;
+
+    for (let i = 0; i < indicators.length; i++) {
+      const bd = baseData[i];
+      const qd = quoteData[i];
+
+      const bLatest = bd.length > 0 ? bd[bd.length - 1].value : null;
+      const qLatest = qd.length > 0 ? qd[qd.length - 1].value : null;
+      const bPrev = bd.length > 1 ? bd[bd.length - 2].value : null;
+      const qPrev = qd.length > 1 ? qd[qd.length - 2].value : null;
+
+      const bTrend = bLatest !== null && bPrev !== null ? (bLatest > bPrev ? 'IMPROVING' : bLatest < bPrev ? 'DETERIORATING' : 'STABLE') : 'UNKNOWN';
+      const qTrend = qLatest !== null && qPrev !== null ? (qLatest > qPrev ? 'IMPROVING' : qLatest < qPrev ? 'DETERIORATING' : 'STABLE') : 'UNKNOWN';
+
+      let div = 0;
+      let favors = 'NEUTRAL';
+      if (bLatest !== null && qLatest !== null) {
+        validCount++;
+        const isInverted = indicators[i] === 'unemployment_rate';
+        if (isInverted) {
+          div = qLatest - bLatest; // Lower unemployment = better
+        } else {
+          div = bLatest - qLatest;
+        }
+
+        // GDP and PMI: higher = better for currency
+        // CPI: moderate is good, too high or too low is bad
+        // Unemployment: lower = better
+        if (indicators[i] === 'cpi') {
+          // CPI: closer to 2% target is better
+          const bDistFromTarget = Math.abs(bLatest - 2.0);
+          const qDistFromTarget = Math.abs(qLatest - 2.0);
+          div = qDistFromTarget - bDistFromTarget; // positive = base closer to target
+        }
+
+        if (div > 0) favors = base;
+        else if (div < 0) favors = quote;
+
+        // Trend scoring
+        const trendScore = (bTrend === 'IMPROVING' ? 1 : bTrend === 'DETERIORATING' ? -1 : 0)
+          - (qTrend === 'IMPROVING' ? 1 : qTrend === 'DETERIORATING' ? -1 : 0);
+        compositeScore += (div > 0 ? 1 : div < 0 ? -1 : 0) + trendScore * 0.5;
+      }
+
+      comparison.push({
+        indicator: indicatorLabels[i],
+        base: { latest: bLatest !== null ? Math.round(bLatest * 100) / 100 : null, trend: bTrend },
+        quote: { latest: qLatest !== null ? Math.round(qLatest * 100) / 100 : null, trend: qTrend },
+        divergence: Math.round(div * 100) / 100,
+        favorsCurrency: favors,
+      });
+    }
+
+    // Rate differential
+    const baseRate = CENTRAL_BANK_RATES[base];
+    const quoteRate = CENTRAL_BANK_RATES[quote];
+    const rateDiff = baseRate && quoteRate ? baseRate.rate - quoteRate.rate : 0;
+    if (baseRate && quoteRate) {
+      compositeScore += rateDiff > 1 ? 1.5 : rateDiff > 0 ? 0.5 : rateDiff < -1 ? -1.5 : rateDiff < 0 ? -0.5 : 0;
+      validCount++;
+    }
+
+    const normalizedScore = validCount > 0 ? compositeScore / validCount : 0;
+    const pair = `${base}/${quote}`;
+
+    return formatToolResult({
+      pair,
+      base: { country: base, name: baseName },
+      quote: { country: quote, name: quoteName },
+      indicators: comparison,
+      rateDifferential: baseRate && quoteRate ? {
+        base: `${baseRate.rate}% (${baseRate.direction})`,
+        quote: `${quoteRate.rate}% (${quoteRate.direction})`,
+        spread: `${rateDiff > 0 ? '+' : ''}${rateDiff.toFixed(2)}%`,
+      } : null,
+      compositeScore: {
+        raw: Math.round(compositeScore * 100) / 100,
+        normalized: Math.round(normalizedScore * 1000) / 1000,
+        scale: '-2.0 (strong quote bias) to +2.0 (strong base bias)',
+        validIndicators: validCount,
+      },
+      signal: normalizedScore > 0.5
+        ? `BULLISH ${pair}: Macro fundamentals favor ${base} over ${quote}. Score: ${normalizedScore.toFixed(2)}`
+        : normalizedScore < -0.5
+          ? `BEARISH ${pair}: Macro fundamentals favor ${quote} over ${base}. Score: ${normalizedScore.toFixed(2)}`
+          : `NEUTRAL: No strong macro divergence between ${base} and ${quote}. Score: ${normalizedScore.toFixed(2)}`,
+      confidence: validCount >= 4 ? 'HIGH' : validCount >= 2 ? 'MODERATE' : 'LOW',
+    }, []);
+  },
+});
+
+// ============================================================================
+// Tool: Seasonal Pattern Analysis
+// ============================================================================
+
+const SeasonalInputSchema = z.object({
+  symbol: z.string().describe('Instrument symbol'),
+  yearsBack: z.number().default(5).describe('Number of years of data to analyze (max 10)'),
+});
+
+export const getSeasonalPattern = new DynamicStructuredTool({
+  name: 'get_seasonal_pattern',
+  description: 'Analyze monthly/quarterly seasonal patterns in an instrument. Returns average return, win rate, and consistency for each month. Useful for timing entries and understanding calendar effects.',
+  schema: SeasonalInputSchema,
+  func: async (input) => {
+    const resolved = resolveSymbol(input.symbol);
+    if (!resolved) {
+      return formatToolResult({ error: `Unknown instrument: ${input.symbol}` }, []);
+    }
+
+    // Fetch weekly data (more efficient for multi-year)
+    const outputsize = Math.min(input.yearsBack * 52, 520);
+    const { data } = await api.get('/time_series', {
+      symbol: resolved.apiSymbol,
+      interval: '1week',
+      outputsize,
+    });
+
+    const values = (data.values || []) as Array<{ close: string; datetime: string }>;
+    if (values.length < 52) {
+      return formatToolResult({ error: 'Insufficient data for seasonal analysis (need at least 1 year)' }, []);
+    }
+
+    // Reverse to chronological
+    const chronological = [...values].reverse();
+
+    // Group by month
+    const monthlyReturns: Record<number, number[]> = {};
+    for (let m = 1; m <= 12; m++) monthlyReturns[m] = [];
+
+    // Calculate monthly returns from weekly data
+    let prevMonthClose: number | null = null;
+    let prevMonth: number | null = null;
+
+    for (const bar of chronological) {
+      const date = new Date(bar.datetime);
+      const month = date.getMonth() + 1;
+      const close = parseFloat(bar.close);
+
+      if (prevMonth !== null && prevMonth !== month && prevMonthClose !== null) {
+        const ret = (close - prevMonthClose) / prevMonthClose;
+        monthlyReturns[month].push(ret);
+        prevMonthClose = close;
+        prevMonth = month;
+      } else if (prevMonth === null || prevMonth !== month) {
+        prevMonthClose = close;
+        prevMonth = month;
+      }
+    }
+
+    const monthNames = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+    const monthly = Object.entries(monthlyReturns).map(([m, rets]) => {
+      const month = parseInt(m);
+      if (rets.length === 0) return { month: monthNames[month], avgReturn: 0, winRate: 0, sampleSize: 0, consistency: 'NO_DATA' };
+      const avg = rets.reduce((s, v) => s + v, 0) / rets.length;
+      const wins = rets.filter(r => r > 0).length;
+      const winRate = wins / rets.length;
+      const consistency = winRate > 0.7 ? 'STRONG' : winRate > 0.6 ? 'MODERATE' : 'WEAK';
+      return {
+        month: monthNames[month],
+        avgReturn: `${(avg * 100).toFixed(2)}%`,
+        winRate: `${(winRate * 100).toFixed(0)}%`,
+        sampleSize: rets.length,
+        consistency,
+      };
+    });
+
+    // Best and worst months
+    const validMonths = monthly.filter(m => m.sampleSize > 0);
+    const sorted = [...validMonths].sort((a, b) => parseFloat(String(b.avgReturn)) - parseFloat(String(a.avgReturn)));
+
+    // Quarterly aggregation
+    const quarters = [
+      { name: 'Q1 (Jan-Mar)', months: [1, 2, 3] },
+      { name: 'Q2 (Apr-Jun)', months: [4, 5, 6] },
+      { name: 'Q3 (Jul-Sep)', months: [7, 8, 9] },
+      { name: 'Q4 (Oct-Dec)', months: [10, 11, 12] },
+    ].map(q => {
+      const qRets = q.months.flatMap(m => monthlyReturns[m]);
+      if (qRets.length === 0) return { quarter: q.name, avgReturn: 'N/A', winRate: 'N/A' };
+      const avg = qRets.reduce((s, v) => s + v, 0) / qRets.length;
+      const winRate = qRets.filter(r => r > 0).length / qRets.length;
+      return { quarter: q.name, avgReturn: `${(avg * 100).toFixed(2)}%`, winRate: `${(winRate * 100).toFixed(0)}%` };
+    });
+
+    // Current month context
+    const now = new Date();
+    const currentMonth = now.getMonth() + 1;
+    const currentMonthData = monthly[currentMonth - 1];
+
+    return formatToolResult({
+      instrument: input.symbol.toUpperCase(),
+      yearsAnalyzed: input.yearsBack,
+      currentMonth: {
+        name: monthNames[currentMonth],
+        historicalPattern: currentMonthData,
+      },
+      monthlyPatterns: monthly,
+      quarterlyPatterns: quarters,
+      bestMonths: sorted.slice(0, 3).map(m => `${m.month}: ${m.avgReturn} (${m.winRate} win rate)`),
+      worstMonths: sorted.slice(-3).reverse().map(m => `${m.month}: ${m.avgReturn} (${m.winRate} win rate)`),
     }, []);
   },
 });
