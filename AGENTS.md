@@ -1,7 +1,7 @@
 # リポジトリガイドライン
 
 - リポジトリ: https://github.com/yuya-sugita/sapiens
-- SapiensはFX・株価指数・コモディティの定量トレード分析に特化したCLIベースのAIエージェント。Fintokeiプロップトレーディングに最適化。TypeScript、Ink（CLI用React）、LangChainで構築。
+- Renaissance（旧称 Sapiens）はFX・株価指数・コモディティの定量トレード分析に特化したCLIベースのAIエージェント。Fintokeiプロップトレーディングに最適化。TypeScript、Ink（CLI用React）、LangChainで構築。Jim Simons の Renaissance Technologies へのオマージュとして命名。金融ネイティブのクオンツアナリスト1人と5人の異邦人スペシャリスト（数学者・物理学者・天文学者・音声認識・暗号解読）が同列の6エージェントとして協調する有機体（Prompt 9）として設計されている。システム哲学は `SOUL.md` を、11個の思考プロトコルは `CLAUDE.md` を参照。なおコードベース名・パッケージ名・`.sapiens/` 設定ディレクトリは技術的継続性のため `sapiens` のまま。
 
 ## プロジェクト構成
 
