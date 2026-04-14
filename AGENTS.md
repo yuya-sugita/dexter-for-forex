@@ -105,7 +105,13 @@
 
 - LLMキー: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `MOONSHOT_API_KEY`, `DEEPSEEK_API_KEY`
 - Ollama: `OLLAMA_BASE_URL`（デフォルト `http://127.0.0.1:11434`）
-- 市場データ: `TWELVE_DATA_API_KEY`（価格、指標、経済カレンダー）
+- 市場データ: **APIキー不要**。TradingView MCP（Chrome DevTools Protocol 経由の
+  ローカル接続）を使用。`~/.claude/.mcp.json` に tradingview サーバーを登録し、
+  TradingView Desktop をデバッグポート 9222 付きで起動する。詳細は
+  `CLAUDE.md`「セットアップ > TradingView MCP」参照。
+- 経済カレンダー・マクロ指標の暫定措置: `TWELVE_DATA_API_KEY`（`get_economic_calendar`,
+  `get_macro_regime`, `get_rate_differential`, `get_yield_curve`, `get_macro_divergence`
+  のみ依存。TradingView MCP には該当機能がないため移行先未定）。
 - 検索: `EXASEARCH_API_KEY`（優先）, `PERPLEXITY_API_KEY`, `TAVILY_API_KEY`（フォールバック）
 - トレース: `LANGSMITH_API_KEY`, `LANGSMITH_ENDPOINT`, `LANGSMITH_PROJECT`, `LANGSMITH_TRACING`
 - `.env`ファイルや実際のAPIキーを絶対にコミットしない。

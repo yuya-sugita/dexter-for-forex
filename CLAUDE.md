@@ -5,13 +5,45 @@ Claude Code上では、`src/tool-runner.ts` を通じてすべてのツールを
 
 ## セットアップ
 
+### データソース: TradingView MCP
+
+Sapiensの市場データは**TradingView Desktop**アプリを介して取得する。
+Chrome DevTools Protocol (CDP) 経由でローカル接続するため、Twelve Data
+のような外部APIキーは不要。有効なTradingViewサブスクリプションと、
+デバッグポートを有効化したTradingView Desktopの起動が必須要件。
+
 ```bash
-# 依存関係（インストール済み）
+# 依存関係インストール
 bun install --ignore-scripts
 
-# .env にTWELVE_DATA_API_KEYを設定（市場データ用、必須）
-# 無料キー取得: https://twelvedata.com/
+# TradingView MCPサーバーの用意（ローカルPCで実行）
+git clone https://github.com/tradesdontlie/tradingview-mcp.git
+cd tradingview-mcp && npm install
+
+# ~/.claude/.mcp.json に以下を追加:
+# {
+#   "mcpServers": {
+#     "tradingview": {
+#       "command": "node",
+#       "args": ["/ABSOLUTE/PATH/TO/tradingview-mcp/src/server.js"]
+#     }
+#   }
+# }
+
+# TradingView Desktopをデバッグポート付きで起動
+# Mac:   ./scripts/launch_tv_debug_mac.sh
+# Linux: ./scripts/launch_tv_debug_linux.sh
+# Win:   scripts\launch_tv_debug.bat
+#
+# 接続確認: Claude Codeで `tv_health_check` を呼び出す
 ```
+
+> **注: 経済カレンダー・マクロ指標は TradingView MCP では提供されない。**
+> `get_economic_calendar` / `get_macro_regime` / `get_rate_differential`
+> / `get_yield_curve` / `get_macro_divergence` は現行実装が Twelve Data
+> の経済指標APIに依存しているため、TradingView MCP への完全移行には
+> 別データソース（FRED, ECB, Forex Factory等）への置き換えが必要。
+> 詳細は下記「データソース移行の状況」セクションを参照。
 
 ## ツール実行方法
 
@@ -34,7 +66,7 @@ bun run src/tool-runner.ts skill <skill_name>
 
 ## 利用可能なツール
 
-### 市場データ（Twelve Data API経由）
+### 市場データ（TradingView MCP経由）
 
 | ツール | 説明 | 必須引数 |
 |--------|------|----------|
@@ -107,11 +139,53 @@ bun run src/tool-runner.ts skill <skill_name>
 |--------|------|
 | `web_fetch` | URLからコンテンツ取得 |
 
-## API制限
+## API制限とデータソース
 
-Twelve Data無料プラン: **8リクエスト/分、800リクエスト/日**。
-ツール呼び出しは1つずつ順番に実行し、結果を待ってから次へ進む。
-レート制限は`src/tools/forex/api.ts`で自動管理される。
+### TradingView MCP（市場データ用）
+
+- **接続形式**: Chrome DevTools Protocol (ローカルポート 9222)
+- **レート**: 外部APIではなくローカルアプリへの接続のため、Twelve Data
+  のような固定リクエスト制限はない。ただし TradingView Desktop の
+  応答性を損なわないよう、**ツール呼び出しは1つずつ順番に実行**する
+  原則は維持する（Prompt 1 の「結果を待ってから次へ進む」と整合）
+- **要件**: TradingView Desktop が有効なサブスクリプションで起動済み、
+  かつ `--remote-debugging-port=9222` 指定で立ち上がっていること
+- **失敗時**: `tv_health_check` で接続を確認。切断時はデバッグポート
+  付きで TradingView を再起動する
+
+### データソース移行の状況
+
+Sapiens は Twelve Data から TradingView MCP へ移行中。現時点での状態:
+
+| カテゴリ | ツール例 | 現行データソース | 移行先 | 状態 |
+|---|---|---|---|---|
+| 価格・OHLCV | `get_price`, `get_price_history` | Twelve Data | TradingView MCP | 未移行（実装は `src/tools/forex/api.ts`） |
+| テクニカル指標 | `get_technical_indicator`, `get_multi_indicators` | Twelve Data | TradingView MCP | 未移行 |
+| 統計分析 | `get_zscore`, `get_return_distribution` 他 | 上記市場データを加工 | 上流に追従 | 上流の移行に依存 |
+| 経済カレンダー | `get_economic_calendar` | Twelve Data | **要別ソース** | 移行先未定 |
+| マクロ指標 | `get_macro_regime`, `get_rate_differential`, `get_yield_curve`, `get_macro_divergence` | Twelve Data | **要別ソース** | 移行先未定 |
+
+**経済指標系の候補データソース:**
+
+- **FRED** (Federal Reserve Economic Data) — 米国マクロ指標（GDP/CPI/
+  失業率/金利）。無料・APIキー要・商用可
+- **ECB Statistical Data Warehouse** — 欧州マクロ指標。無料・API提供
+- **Forex Factory / Investing.com** — 経済カレンダー。スクレイピング
+  またはサードパーティAPI
+- **Trading Economics** — 有料だがマクロ指標を広範にカバー
+
+経済指標系ツールの移行方針が確定するまで、該当ツールは Twelve Data
+で動作し続ける（`TWELVE_DATA_API_KEY` を `.env` に設定した場合のみ）。
+Sapiens の **Prompt 9 (モノリシック・モデル)** の観点からは、市場
+データ層と経済指標層の二重化は望ましくないため、移行先を早期確定
+する必要がある。
+
+**コード実装の現状:** 実装ファイル (`src/tools/forex/api.ts`,
+`economic-calendar.ts`, `macro-analysis.ts`) は本ドキュメント更新時点で
+まだ Twelve Data API を呼び出している。MCP クライアント経由の実装に
+差し替えるリファクタは別タスクとして進める。それまでは「ドキュメント
+上の方針は TradingView MCP」「コード上の実装は Twelve Data のまま」
+という過渡状態であることに注意。
 
 ## 銘柄シンボル
 
