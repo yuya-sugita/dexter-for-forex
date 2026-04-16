@@ -10,15 +10,16 @@
 
 import { BOT_CONFIG } from './config.js';
 import { listMarkets, passesFilters, getYesPrice } from './gamma-api.js';
-import { computeConfluence, evaluateGate } from './confluence.js';
+import { evaluateGate } from './confluence.js';
 import { computeSize, computeAlphaLevel, computeDrawdown } from './sizer.js';
 import { checkKillSwitch, activateKillSwitch } from './kill-switch.js';
+import { runAllAgents } from './agents.js';
 import {
   ensureBotDirs, loadState, saveState,
   loadOpenPositions, appendShadowLog,
   isOnCooldown, markAnalyzed, appendDailyMetric,
 } from './state.js';
-import type { ShadowLogEntry, OutsiderDiagnosis, QuantDiagnosis } from './types.js';
+import type { ShadowLogEntry } from './types.js';
 
 // ============================================================================
 // Main Loop
@@ -78,10 +79,28 @@ async function runAnalysisCycle(): Promise<void> {
     console.log(`\n[Analyze] ${market.slug} (${market.question.slice(0, 60)}...)`);
     console.log(`  YES: ${getYesPrice(market).toFixed(2)} | Vol 24h: $${market.volume_24hr?.toFixed(0)}`);
 
-    // TODO (Phase 1 next step): Call 6 agents via LLM for real diagnoses.
-    // For now, produce a placeholder to validate the full pipeline.
-    const outsiders = createPlaceholderOutsiderDiagnoses(market.id);
-    const quant = createPlaceholderQuantDiagnosis(market.id, getYesPrice(market), state);
+    // Call all 6 agents via LLM (sequential, Prompt 1 compliant)
+    let outsiders, quant;
+    try {
+      const result = await runAllAgents(market);
+      outsiders = result.outsiders;
+      quant = result.quant;
+    } catch (err) {
+      console.error(`  [Analyze] Agent error, skipping market:`, err);
+      state = markAnalyzed(state, market.id);
+      continue;
+    }
+
+    // Compute proper position size via sizer
+    const sizeResult = computeSize({
+      estimated_true_prob: quant.estimated_true_prob,
+      market_price: quant.market_price,
+      bankroll_usd: BOT_CONFIG.INITIAL_BANKROLL_USD,
+      confluence_count: quant.confluence_count,
+      quant_confidence: quant.ev_per_dollar > 0 ? 0.8 : 0.4,
+      alpha_value: state.alpha_value,
+    });
+    quant.position_size_usd = sizeResult.position_size_usd;
 
     // Decision Gate
     const decision = evaluateGate({
@@ -122,53 +141,6 @@ async function runAnalysisCycle(): Promise<void> {
   });
 
   console.log(`\n[Cycle Complete] Next in ${BOT_CONFIG.ANALYSIS_INTERVAL_MIN}min`);
-}
-
-// ============================================================================
-// Placeholder Agent Diagnoses (to be replaced by real LLM calls)
-// ============================================================================
-
-function createPlaceholderOutsiderDiagnoses(market_id: string): OutsiderDiagnosis[] {
-  // In Phase 1 implementation, these will call the LLM with each
-  // outsider's SKILL.md prompt and parse structured JSON output.
-  // For pipeline validation, return NEUTRAL placeholders.
-  const agents = [
-    'outsider-mathematician',
-    'outsider-physicist',
-    'outsider-astronomer',
-    'outsider-speech-recognition',
-    'outsider-cryptanalyst',
-  ] as const;
-
-  return agents.map((agent) => ({
-    agent,
-    market_id,
-    direction: 'NEUTRAL' as const,
-    confidence: 0,
-    reasoning_key: 'placeholder — LLM integration pending',
-    data_points: {},
-  }));
-}
-
-function createPlaceholderQuantDiagnosis(
-  market_id: string,
-  yes_price: number,
-  state: import('./types.js').BotState,
-): QuantDiagnosis {
-  return {
-    agent: 'quant-analyst',
-    market_id,
-    estimated_true_prob: yes_price, // no edge in placeholder
-    market_price: yes_price,
-    edge: 0,
-    direction: 'YES',
-    kelly_fraction: 0,
-    recommended_fraction: 0,
-    position_size_usd: 0,
-    ruin_probability: 0,
-    confluence_count: 0,
-    ev_per_dollar: 0,
-  };
 }
 
 // ============================================================================
