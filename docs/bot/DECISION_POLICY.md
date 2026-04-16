@@ -152,9 +152,9 @@ position_size = min(position_size, bankroll × MAX_POSITION_PCT / 100)
 - ポジション縮小は α で一律適用（Prompt 8）、個別縮小は禁止
 - 解決済み市場は自動精算（mark_resolved）
 
-## TODO: ユーザーが決定する数値
+## 確定パラメータ
 
-| パラメータ | デフォルト案 | 説明 |
+| パラメータ | 決定値 | 説明 |
 |---|---|---|
 | `MIN_LIQUIDITY` | $5,000 | 24h出来高の最低ライン |
 | `MIN_DAYS_TO_RESOLVE` | 3 | 解決日までの最短日数 |

@@ -111,16 +111,14 @@ Phase ごとの上限:
 秘密鍵がメモリ上に存在する時間を最小化する。署名処理の直前にのみ
 復号し、署名後に即座にメモリからクリアする。
 
-## TODO: ユーザーが決定する数値
+## 確定パラメータ
 
-以下のパラメータは本ドキュメントで**デフォルト案**を提示しているが、
-実際の運用値はユーザーのバンクロール・リスク選好・法域に依存する:
-
-- [ ] `INITIAL_BANKROLL`: Phase 2 の初期入金額
-- [ ] `MAX_POSITION_USD`: Phase 2 の1ベット上限
-- [ ] `KILL_SWITCH_DD_PCT`: kill switch の DD%（デフォルト 40% は
-  保守的か積極的か）
-- [ ] `ALLOWED_CATEGORIES`: 最初に対象とするカテゴリ
-- [ ] 鍵管理方式（Phase 2）: 暗号化 keystore で十分か
-- [ ] 通知先: Discord webhook URL / Telegram bot token / なし
-- [ ] 法域確認: Polymarket Terms の準拠状況
+| 項目 | 決定値 |
+|---|---|
+| `INITIAL_BANKROLL` | $200 (Phase 2) |
+| `MAX_POSITION_USD` | $20 (Phase 2) |
+| `KILL_SWITCH_DD_PCT` | 40% |
+| `ALLOWED_CATEGORIES` | ["politics"] |
+| 鍵管理方式 | 暗号化 keystore (Phase 2) |
+| 通知先 | Discord webhook |
+| 法域 | 確認済み・問題なし |

@@ -21,18 +21,18 @@
 
 ### 卒業条件
 
-以下の全 TODO 項目に決定値が記入されていること:
+全 TODO 項目に決定値を記入 → **Phase 0 卒業済み**
 
-- [ ] 法域確認
-- [ ] `INITIAL_BANKROLL` (Phase 2 用)
-- [ ] `ALLOWED_CATEGORIES`
-- [ ] `KILL_SWITCH_DD_PCT`
-- [ ] `MAX_POSITION_USD` (Phase 2 用)
-- [ ] 鍵管理方式
-- [ ] 通知先
-- [ ] `ANALYSIS_INTERVAL_MIN`
-- [ ] `MIN_EDGE`
-- [ ] `CONFLUENCE_THRESHOLD`
+- [x] 法域確認 → 問題なし
+- [x] `INITIAL_BANKROLL` (Phase 2 用) → $200
+- [x] `ALLOWED_CATEGORIES` → ["politics"]
+- [x] `KILL_SWITCH_DD_PCT` → 40%
+- [x] `MAX_POSITION_USD` (Phase 2 用) → $20
+- [x] 鍵管理方式 → 暗号化 keystore
+- [x] 通知先 → Discord webhook
+- [x] `ANALYSIS_INTERVAL_MIN` → 60分
+- [x] `MIN_EDGE` → 0.05 (5%)
+- [x] `CONFLUENCE_THRESHOLD` → 4/6
 
 ## Phase 1: Shadow Trading
 
