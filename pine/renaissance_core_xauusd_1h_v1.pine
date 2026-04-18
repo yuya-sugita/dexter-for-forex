@@ -1,0 +1,205 @@
+//@version=5
+// Renaissance Core Strategy — XAUUSD 1h
+// 生成原理: 独立な弱シグナルの AND 結合（Prompt 6 × Prompt 10 × Prompt 11）
+// 層構成:
+//   L1: z-score 平均回帰（核シグナル）
+//   L2: ボラレジームフィルター（CRISIS/死市場の除外）
+//   L3: 長期トレンド方向フィルター（強逆行の回避）
+//   L4: セッションフィルター（低流動性・週末リスクの除外）
+// サイジング: DD 段階に応じた機械的スカラー縮小（Prompt 8）
+
+strategy(
+     title                    = "Renaissance Core XAUUSD 1h",
+     shorttitle               = "RenCore",
+     overlay                  = true,
+     initial_capital          = 10000,
+     default_qty_type         = strategy.fixed,
+     default_qty_value        = 0,
+     pyramiding               = 0,
+     calc_on_every_tick       = false,
+     process_orders_on_close  = true,
+     commission_type          = strategy.commission.percent,
+     commission_value         = 0.002)
+
+// ============================================================================
+// Parameters — 6 個に抑制 (Prompt 11: パラメータ数を自慢しない)
+// ============================================================================
+
+zLookback      = input.int(20,    "L1 Z-score Lookback",       minval = 10, maxval = 100, group = "Layers")
+zThreshold     = input.float(2.0, "L1 Z-score Threshold",      minval = 1.5, maxval = 3.0, step = 0.1, group = "Layers")
+atrPeriod      = input.int(14,    "L2 ATR Period (short)",     minval = 5,  maxval = 30,  group = "Layers")
+regimeLookback = input.int(100,   "L2 Regime Lookback (long)", minval = 50, maxval = 200, group = "Layers")
+trendLookback  = input.int(200,   "L3 Trend SMA Lookback",     minval = 100,maxval = 400, group = "Layers")
+stopAtrMult    = input.float(2.5, "Stop Loss ATR Multiplier",  minval = 1.5, maxval = 5.0, step = 0.1, group = "Exit")
+
+// Session (UTC) — NY/London overlap + NY core
+sessionStartH  = input.int(13, "Session Start Hour (UTC)", minval = 0, maxval = 23, group = "Session")
+sessionEndH    = input.int(20, "Session End Hour   (UTC)", minval = 0, maxval = 23, group = "Session")
+
+// Risk sizing — Prompt 8 scalar reduction (機械的・事前決定)
+baseRiskPct    = input.float(0.5,  "Base Risk %",            minval = 0.1, maxval = 2.0, step = 0.1, group = "Risk")
+dd1Threshold   = input.float(10.0, "DD Level 1 % (α=0.50)",  minval = 5,   maxval = 30,  group = "Risk")
+dd2Threshold   = input.float(20.0, "DD Level 2 % (α=0.25)",  minval = 10,  maxval = 40,  group = "Risk")
+dd3Threshold   = input.float(30.0, "DD Level 3 % (α=0.00)",  minval = 20,  maxval = 50,  group = "Risk")
+
+// Time stop (hours == bars on 1h)
+timeStopBars   = input.int(24, "Time Stop (bars)", minval = 6, maxval = 96, group = "Exit")
+
+// ============================================================================
+// Layer 1 — z-score 平均回帰（核シグナル）
+// ============================================================================
+
+priceMean = ta.sma(close, zLookback)
+priceStd  = ta.stdev(close, zLookback)
+zScore    = priceStd > 0 ? (close - priceMean) / priceStd : 0.0
+
+l1Long  = zScore < -zThreshold
+l1Short = zScore >  zThreshold
+
+// ============================================================================
+// Layer 2 — ボラレジームフィルター
+// ============================================================================
+
+atrShort = ta.atr(atrPeriod)
+atrLong  = ta.sma(atrShort, regimeLookback)
+volRatio = atrLong > 0 ? atrShort / atrLong : 1.0
+
+// NORMAL レジーム: 0.5 <= ratio <= 1.5
+// CRISIS (>1.5) と死市場 (<0.5) では新規エントリー禁止
+l2OK = volRatio >= 0.5 and volRatio <= 1.5
+
+// ============================================================================
+// Layer 3 — 長期トレンド方向フィルター（強逆行を避ける）
+// ============================================================================
+
+trendSMA      = ta.sma(close, trendLookback)
+trendSMA20Ago = ta.sma(close, trendLookback)[20]
+trendSlope    = trendSMA20Ago > 0 ? (trendSMA - trendSMA20Ago) / trendSMA20Ago : 0.0
+
+// フラット判定: 20期前 SMA から 1% 以内（XAUUSD のスケールで概ね中立）
+trendFlat = math.abs(trendSlope) < 0.01
+trendUp   = trendSlope >=  0.01
+trendDown = trendSlope <= -0.01
+
+// Long z-score 逆張りは、上昇 or フラットな地合いでのみ許可
+// Short z-score 逆張りは、下降 or フラットな地合いでのみ許可
+l3Long  = trendUp   or trendFlat
+l3Short = trendDown or trendFlat
+
+// ============================================================================
+// Layer 4 — セッションフィルター
+// ============================================================================
+
+hUtc   = hour(time, "UTC")
+dow    = dayofweek(time, "UTC")
+
+inSession      = hUtc >= sessionStartH and hUtc < sessionEndH
+fridayLateExit = dow == dayofweek.friday and hUtc >= 20    // 週末リスク回避
+sundayOpenSkip = dow == dayofweek.sunday                    // 日曜オープン直後のギャップ回避
+
+l4OK = inSession and not fridayLateExit and not sundayOpenSkip
+
+// ============================================================================
+// Prompt 8 — DD 段階的縮小（α のスカラー乗算のみ、構造変更なし）
+// ============================================================================
+
+var float peakEquity = strategy.initial_capital
+peakEquity := math.max(peakEquity, strategy.equity)
+currentDDpct = peakEquity > 0 ? (peakEquity - strategy.equity) / peakEquity * 100.0 : 0.0
+
+alpha = currentDDpct >= dd3Threshold ? 0.00 :
+        currentDDpct >= dd2Threshold ? 0.25 :
+        currentDDpct >= dd1Threshold ? 0.50 : 1.00
+
+riskPct = baseRiskPct * alpha
+
+// ============================================================================
+// Position sizing — 固定リスク建玉（ストップ距離で逆算）
+// ============================================================================
+
+stopDist   = stopAtrMult * atrShort
+riskAmount = strategy.equity * (riskPct / 100.0)
+qtyUnits   = (stopDist > 0 and riskAmount > 0) ? riskAmount / stopDist : 0.0
+
+// ============================================================================
+// Entry — 4 層すべてが成立した時のみ（AND 結合 / Prompt 6）
+// ============================================================================
+
+canEnter = l2OK and l4OK and alpha > 0 and strategy.position_size == 0
+
+longEntry  = canEnter and l1Long  and l3Long
+shortEntry = canEnter and l1Short and l3Short
+
+if longEntry and qtyUnits > 0
+    strategy.entry("L", strategy.long, qty = qtyUnits)
+
+if shortEntry and qtyUnits > 0
+    strategy.entry("S", strategy.short, qty = qtyUnits)
+
+// ============================================================================
+// Exits —
+//   (a) z-score 回帰（|z| < 0.5）
+//   (b) ATR ストップ（エントリー時点の価格基準）
+//   (c) タイムストップ（timeStopBars）
+// ============================================================================
+
+var float entryPrice = na
+var int   entryBar   = na
+
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    entryPrice := strategy.position_avg_price
+    entryBar   := bar_index
+
+zReverted = math.abs(zScore) < 0.5
+
+// (a) z-score 回帰クローズ
+if strategy.position_size > 0 and zReverted
+    strategy.close("L", comment = "z-revert")
+if strategy.position_size < 0 and zReverted
+    strategy.close("S", comment = "z-revert")
+
+// (b) ATR ストップ
+if strategy.position_size > 0 and not na(entryPrice)
+    strategy.exit("L-stop", from_entry = "L", stop = entryPrice - stopDist)
+if strategy.position_size < 0 and not na(entryPrice)
+    strategy.exit("S-stop", from_entry = "S", stop = entryPrice + stopDist)
+
+// (c) タイムストップ
+barsHeld = not na(entryBar) ? bar_index - entryBar : 0
+if strategy.position_size != 0 and barsHeld >= timeStopBars
+    strategy.close_all(comment = "time")
+
+// ポジションが消えたら状態リセット
+if strategy.position_size == 0
+    entryPrice := na
+    entryBar   := na
+
+// ============================================================================
+// Visualization — 診断用。取引ロジックには影響しない。
+// ============================================================================
+
+plot(trendSMA, title = "L3 Trend SMA", color = color.new(color.gray, 60), linewidth = 1)
+plot(priceMean, title = "L1 Mean",     color = color.new(color.aqua, 40), linewidth = 1)
+
+bgcolor(not l2OK ? color.new(color.red,    90) : na, title = "L2 Regime OFF")
+bgcolor(not l4OK ? color.new(color.orange, 92) : na, title = "L4 Session OFF")
+bgcolor(alpha < 1.0 ? color.new(color.yellow, 90) : na, title = "DD Reduced")
+
+plotshape(longEntry,  title = "Long Entry",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
+plotshape(shortEntry, title = "Short Entry", style = shape.triangledown, location = location.abovebar, color = color.new(color.red,   0), size = size.tiny)
+
+// Info table (optional, light)
+var table info = table.new(position.top_right, 2, 6, border_width = 1)
+if barstate.islast
+    table.cell(info, 0, 0, "z-score",   text_color = color.white)
+    table.cell(info, 1, 0, str.tostring(zScore, "#.##"),   text_color = color.white)
+    table.cell(info, 0, 1, "vol ratio", text_color = color.white)
+    table.cell(info, 1, 1, str.tostring(volRatio, "#.##"), text_color = color.white)
+    table.cell(info, 0, 2, "trend",     text_color = color.white)
+    table.cell(info, 1, 2, trendUp ? "UP" : trendDown ? "DOWN" : "FLAT", text_color = color.white)
+    table.cell(info, 0, 3, "session",   text_color = color.white)
+    table.cell(info, 1, 3, l4OK ? "ON" : "OFF", text_color = color.white)
+    table.cell(info, 0, 4, "DD %",      text_color = color.white)
+    table.cell(info, 1, 4, str.tostring(currentDDpct, "#.#"), text_color = color.white)
+    table.cell(info, 0, 5, "alpha",     text_color = color.white)
+    table.cell(info, 1, 5, str.tostring(alpha, "#.##"), text_color = color.white)
