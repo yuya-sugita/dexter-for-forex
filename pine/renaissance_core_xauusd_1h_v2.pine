@@ -1,0 +1,306 @@
+//@version=5
+// ============================================================================
+// Renaissance Core Strategy — XAUUSD 1h  (v2: 6-Agent Confluence Edition)
+// ============================================================================
+//
+// 哲学の直接翻訳: Prompt 3 × Prompt 6 × Prompt 9 × Prompt 10 × Prompt 11
+//
+// Renaissance は「金融ネイティブのクオンツアナリスト 1 人」と「5 人の異邦人
+// スペシャリスト」を同列のエージェントとして扱う (CLAUDE.md の 6 エージェント
+// 同列制)。5 人の異邦人は各々の原語で独立に「診断」を出し、クオンツアナリストは
+// それらを金融言語に翻訳してサイズ・SL・TP・発注に落とす。
+// この Pine Script は、その 6 人の分業を**コード構造そのもの**として露出させる。
+//
+//   L1: outsider-mathematician  — 分散比検定 (Hurst 相当) による平均回帰構造の同定
+//   L2: outsider-physicist      — ATR 比 + 尖度による相 (phase) 分類
+//   L3: outsider-astronomer     — 長時間積分による信号/ノイズ分離
+//   L4: outsider-speech-rec     — HMM 状態復号 (Viterbi 相当) による地合い推定
+//   L5: outsider-cryptanalyst   — 時間帯/曜日の条件付き分布による高エッジ窓
+//   L6: quant-analyst           — 上記 5 診断の合意を Kelly + DD 制御に翻訳
+//
+// 5 人の異邦人は同時に合意した時のみ発注を許可する (Prompt 3: 散らばれば保留)。
+// クオンツアナリストは単独では動かない (Prompt 3: 金融語話者の合意捏造を禁ず)。
+//
+// 11 プロンプトとの対応:
+//   P1  データ先行        — ナラティブを書かない。数値のみで判定。
+//   P2  51% エッジ        — 勝率を追わず、試行回数 × Kelly で EV を伸ばす。
+//   P3  6 エージェント    — 下記 L1..L6 にそのまま対応。
+//   P4  上書き禁止        — 裁量介入なし。全て条件式で事前定義。
+//   P5  ナラティブ禁止    — 「なぜ」を書かない。条件と閾値のみ。
+//   P6  独立層の AND      — L1..L5 全成立で初めて発注。直交性は意図設計。
+//   P7  失敗もデータ      — strategy.entry の comment で層情報を残し事後分析可能に。
+//   P8  縮小しろパニック不可 — DD 段階で α のスカラー乗算のみ。構造は不変。
+//   P9  モノリシック       — 全層が同一の OHLCV・同一の ATR・同一の z を参照。
+//   P10 尖度 (堀)          — 5 人全員合意の結合条件は高次元、単独層抽出で崩壊。
+//   P11 美しさ             — 1 原理 (独立診断の AND) + 最小パラメータで 6 層生成。
+//
+// ============================================================================
+
+strategy(
+     title                   = "Renaissance 6-Agent Confluence — XAUUSD 1h",
+     shorttitle              = "Ren6A",
+     overlay                 = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 0,
+     pyramiding              = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = true,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.002)
+
+// ============================================================================
+// Shared primitives — Prompt 9 (モノリシック): 全層が同一の原始量を共有
+// ============================================================================
+// 「データ取得 → 統計プリミティブ → レジーム分類 → 診断 → 翻訳 → 執行」の
+// 階層で、全ての層が下位の同じ値を参照する。ここで一度だけ計算する。
+
+ret1     = close - close[1]
+ret5     = close - close[5]
+atr14    = ta.atr(14)
+atr100   = ta.sma(atr14, 100)
+sma20    = ta.sma(close, 20)
+std20    = ta.stdev(close, 20)
+sma50    = ta.sma(close, 50)
+sma200   = ta.sma(close, 200)
+hUtc     = hour(time, "UTC")
+dow      = dayofweek(time, "UTC")
+
+// 生 z-score (全層が参照)
+zRaw = std20 > 0 ? (close - sma20) / std20 : 0.0
+
+// ============================================================================
+// L1 — OUTSIDER MATHEMATICIAN  (数学者)
+// ============================================================================
+// 原語: 構造・不変量・位相。Hurst 指数 H と分散比 VR で系列の性質を同定する。
+//   VR = Var(k 期リターン) / (k × Var(1 期リターン))
+//   VR < 1 → 平均回帰的 (H < 0.5)
+//   VR ≈ 1 → ランダムウォーク (H ≈ 0.5)
+//   VR > 1 → トレンド的 (H > 0.5)
+// 診断: 平均回帰戦略を回せる「位相」にあるか否か。金融語は一切使わない。
+
+mathLookback = input.int(100, "L1 Variance-Ratio Lookback", minval = 50, maxval = 300, group = "L1 Mathematician")
+mathK        = input.int(5,   "L1 Variance-Ratio Lag k",    minval = 2,  maxval = 20,  group = "L1 Mathematician")
+mathVRMax    = input.float(0.90, "L1 VR Upper Bound (MR)",  minval = 0.5, maxval = 1.0, step = 0.05, group = "L1 Mathematician")
+
+var1 = ta.variance(ret1, mathLookback)
+varK = ta.variance(ret5, mathLookback)
+vr   = var1 > 0 ? varK / (mathK * var1) : 1.0
+
+l1_math_MR_regime = vr < mathVRMax   // 平均回帰構造が確認されている
+
+// ============================================================================
+// L2 — OUTSIDER PHYSICIST  (物理学者)
+// ============================================================================
+// 原語: 相転移・臨界現象・保存則。
+//   atr_short / atr_long を秩序変数とし、相を分類:
+//     LAMINAR (ratio < 0.5)       — 死市場、信号が埋没する
+//     NORMAL  (0.5 ≤ ratio ≤ 1.5) — 定常相、平均回帰が働く相
+//     CRITICAL (ratio > 1.5)      — 臨界ゆらぎ、相転移の可能性
+//   加えてファットテール (|ret| / σ > 4) を検出し、臨界ゆらぎを排除する。
+
+physLaminarLo = input.float(0.5,  "L2 Laminar Lower",  minval = 0.1, maxval = 0.9, step = 0.05, group = "L2 Physicist")
+physCriticalHi = input.float(1.5, "L2 Critical Upper", minval = 1.1, maxval = 3.0, step = 0.1,  group = "L2 Physicist")
+physTailSigma = input.float(4.0,  "L2 Tail σ Max",     minval = 2.0, maxval = 6.0, step = 0.5,  group = "L2 Physicist")
+
+atrRatio = atr100 > 0 ? atr14 / atr100 : 1.0
+sdRet    = ta.stdev(ret1, 100)
+maxAbs   = ta.highest(math.abs(ret1), 20)
+tailSig  = sdRet > 0 ? maxAbs / sdRet : 0.0
+
+l2_phys_phase_NORMAL = atrRatio >= physLaminarLo and atrRatio <= physCriticalHi and tailSig < physTailSigma
+
+// ============================================================================
+// L3 — OUTSIDER ASTRONOMER  (天文学者)
+// ============================================================================
+// 原語: SN 比・長時間積分・ベイズ収縮。
+// 単発の |z| > 閾値 はノイズかもしれない。複数バー連続で条件が保たれて初めて
+// 「観測された信号」として採用する (longer exposure = higher SNR)。
+
+astroZEntry   = input.float(2.0, "L3 z-entry threshold", minval = 1.5, maxval = 3.0, step = 0.1, group = "L3 Astronomer")
+astroZSustain = input.float(1.5, "L3 z-sustain (t-1)",   minval = 1.0, maxval = 2.5, step = 0.1, group = "L3 Astronomer")
+
+l3_astro_long  = zRaw < -astroZEntry and zRaw[1] < -astroZSustain
+l3_astro_short = zRaw >  astroZEntry and zRaw[1] >  astroZSustain
+
+// ============================================================================
+// L4 — OUTSIDER SPEECH-RECOGNITION  (音声認識エンジニア)
+// ============================================================================
+// 原語: HMM の隠れ状態・遷移確率・Viterbi 復号。
+// 観測から最も尤もらしい状態系列を推定する。ここでは簡略化した 3 状態の
+// 「現在の隠れ状態」が一定期間持続していることを要求する (Viterbi path の安定)。
+//   state = +1 (UP) / 0 (FLAT) / -1 (DOWN)
+// 平均回帰ロングは UP または FLAT のみ、ショートは DOWN または FLAT のみ。
+// (強トレンド逆行は、状態遷移の中途でシグナルが偽陽性になる場面が多い)
+
+hmmSlopePct = input.float(0.005, "L4 Slope threshold (frac)", minval = 0.001, maxval = 0.02, step = 0.001, group = "L4 Speech-Recognition")
+hmmHold     = input.int(5,       "L4 State-hold bars",        minval = 2,     maxval = 20,   group = "L4 Speech-Recognition")
+
+sma50_20ago = sma50[20]
+slopeFrac   = sma50_20ago > 0 ? (sma50 - sma50_20ago) / sma50_20ago : 0.0
+state_now   = slopeFrac > hmmSlopePct ? 1 : slopeFrac < -hmmSlopePct ? -1 : 0
+
+// state の連続性判定 (Viterbi path の安定 = 復号の信頼度)
+state_stable = true
+for i = 1 to 10
+    if i <= hmmHold
+        if state_now != nz(state_now[i])
+            state_stable := false
+
+l4_hmm_long  = state_stable and (state_now == 0 or state_now == 1)
+l4_hmm_short = state_stable and (state_now == 0 or state_now == -1)
+
+// ============================================================================
+// L5 — OUTSIDER CRYPTANALYST  (暗号解読者)
+// ============================================================================
+// 原語: 頻度分析・条件付き分布・情報漏洩。
+// 暗号文 (価格動作) と平文 (時間帯/曜日) の対応関係を過去の頻度分布から抽出し、
+// 「エッジが漏れている窓」のみを有効エントリー条件とする。
+// XAUUSD 1h の既知パターン:
+//   - NY/London 重複帯 (UTC 13–20) で平均回帰頻度が最大
+//   - 日曜オープン・金曜 NY 引け後はノイズ比が高く、エッジが溶ける
+//   - US データ発表時刻 (UTC 12:30 / 14:00 付近) は分布が歪む
+
+cryptoStartH    = input.int(13, "L5 Core session start (UTC)", minval = 0, maxval = 23, group = "L5 Cryptanalyst")
+cryptoEndH      = input.int(20, "L5 Core session end   (UTC)", minval = 0, maxval = 23, group = "L5 Cryptanalyst")
+cryptoSkipData  = input.bool(true, "L5 Skip US data-release hours", group = "L5 Cryptanalyst")
+
+inCore          = hUtc >= cryptoStartH and hUtc < cryptoEndH
+fridayLate      = dow == dayofweek.friday and hUtc >= 20
+sundayOpen      = dow == dayofweek.sunday
+dataReleaseHour = cryptoSkipData and (hUtc == 12 or hUtc == 14)
+
+l5_crypto_high_edge = inCore and not fridayLate and not sundayOpen and not dataReleaseHour
+
+// ============================================================================
+// L6 — QUANT-ANALYST  (金融ネイティブの唯一の内側 / 運動野)
+// ============================================================================
+// Prompt 3: 単独では動かない。5 人の異邦人診断の合意を入力として要求する。
+// 合意が散らばれば判断保留 (翻訳すべき合意が存在しないため)。
+// 役割: 診断 → 執行 (サイズ・SL・リスク閾値) への翻訳。金融言語はここにだけ存在する。
+
+minConfluence = input.int(5, "L6 Min outsider confluence (1-5)", minval = 3, maxval = 5, group = "L6 Quant-Analyst")
+baseRiskPct   = input.float(0.5, "L6 Base risk %", minval = 0.1, maxval = 2.0, step = 0.1, group = "L6 Quant-Analyst")
+stopAtrMult   = input.float(2.5, "L6 Stop ATR mult", minval = 1.5, maxval = 5.0, step = 0.1, group = "L6 Quant-Analyst")
+timeStopBars  = input.int(24, "L6 Time stop (bars)", minval = 6, maxval = 96, group = "L6 Quant-Analyst")
+
+// 合意カウント (long / short 別)
+longCount  = (l1_math_MR_regime ? 1 : 0) + (l2_phys_phase_NORMAL ? 1 : 0) + (l3_astro_long  ? 1 : 0) + (l4_hmm_long  ? 1 : 0) + (l5_crypto_high_edge ? 1 : 0)
+shortCount = (l1_math_MR_regime ? 1 : 0) + (l2_phys_phase_NORMAL ? 1 : 0) + (l3_astro_short ? 1 : 0) + (l4_hmm_short ? 1 : 0) + (l5_crypto_high_edge ? 1 : 0)
+
+longConfluence  = longCount  >= minConfluence
+shortConfluence = shortCount >= minConfluence
+
+// Prompt 8: DD 段階的スカラー縮小 (構造は触らない。α のみ動かす)
+dd1 = input.float(10.0, "α→0.50 at DD%", group = "Prompt 8 — DD Reduction")
+dd2 = input.float(20.0, "α→0.25 at DD%", group = "Prompt 8 — DD Reduction")
+dd3 = input.float(30.0, "α→0.00 at DD%", group = "Prompt 8 — DD Reduction")
+
+var float peakEq = strategy.initial_capital
+peakEq := math.max(peakEq, strategy.equity)
+ddPct  = peakEq > 0 ? (peakEq - strategy.equity) / peakEq * 100.0 : 0.0
+
+alpha = ddPct >= dd3 ? 0.00 : ddPct >= dd2 ? 0.25 : ddPct >= dd1 ? 0.50 : 1.00
+
+// 翻訳: 合意 + α → サイズ
+riskPct    = baseRiskPct * alpha
+stopDist   = stopAtrMult * atr14
+riskAmount = strategy.equity * (riskPct / 100.0)
+qtyUnits   = (stopDist > 0 and riskAmount > 0) ? riskAmount / stopDist : 0.0
+
+// ============================================================================
+// Execution — 6 エージェント合意時のみ発注
+// ============================================================================
+// Prompt 4: 裁量介入なし。全条件は事前に書かれており、実行時改変は禁止。
+// Prompt 7: entry comment に合意情報を残し、事後 post-mortem の入力にする。
+
+canEnter = alpha > 0 and strategy.position_size == 0
+
+longEntry  = canEnter and longConfluence
+shortEntry = canEnter and shortConfluence
+
+if longEntry and qtyUnits > 0
+    strategy.entry("L", strategy.long,  qty = qtyUnits, comment = "L6:conf=" + str.tostring(longCount) + "/5 α=" + str.tostring(alpha, "#.##"))
+
+if shortEntry and qtyUnits > 0
+    strategy.entry("S", strategy.short, qty = qtyUnits, comment = "L6:conf=" + str.tostring(shortCount) + "/5 α=" + str.tostring(alpha, "#.##"))
+
+// Exits:
+//   (a) astronomer の「信号消滅」(|z| < 0.5) → 観測が収まった
+//   (b) stop: 2.5 × ATR (入口からの固定距離)
+//   (c) 時間切れ: 24 バー
+var float entryPx  = na
+var int   entryBar = na
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    entryPx  := strategy.position_avg_price
+    entryBar := bar_index
+
+zReverted = math.abs(zRaw) < 0.5
+if strategy.position_size > 0 and zReverted
+    strategy.close("L", comment = "z-revert")
+if strategy.position_size < 0 and zReverted
+    strategy.close("S", comment = "z-revert")
+
+if strategy.position_size > 0 and not na(entryPx)
+    strategy.exit("L-stop", from_entry = "L", stop = entryPx - stopDist)
+if strategy.position_size < 0 and not na(entryPx)
+    strategy.exit("S-stop", from_entry = "S", stop = entryPx + stopDist)
+
+barsHeld = not na(entryBar) ? bar_index - entryBar : 0
+if strategy.position_size != 0 and barsHeld >= timeStopBars
+    strategy.close_all(comment = "time")
+
+if strategy.position_size == 0
+    entryPx  := na
+    entryBar := na
+
+// ============================================================================
+// Diagnostics — 6 人の診断を可視化 (取引ロジックには影響しない)
+// ============================================================================
+
+plot(sma20,  title = "Astro mean (sma20)",  color = color.new(color.aqua,  40))
+plot(sma200, title = "HMM reference (sma200)", color = color.new(color.gray,  60))
+
+bgcolor(not l1_math_MR_regime    ? color.new(color.purple, 92) : na, title = "L1 Math OFF")
+bgcolor(not l2_phys_phase_NORMAL ? color.new(color.red,    92) : na, title = "L2 Phys OFF")
+bgcolor(not l5_crypto_high_edge  ? color.new(color.orange, 93) : na, title = "L5 Crypto OFF")
+
+plotshape(longEntry,  title = "Long entry (5/5)",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
+plotshape(shortEntry, title = "Short entry (5/5)", style = shape.triangledown, location = location.abovebar, color = color.new(color.red,   0), size = size.tiny)
+
+// 6 エージェント状態テーブル
+var table agentTable = table.new(position.top_right, 3, 8, border_width = 1)
+if barstate.islast
+    table.cell(agentTable, 0, 0, "Agent",      bgcolor = color.new(color.black, 20), text_color = color.white)
+    table.cell(agentTable, 1, 0, "Diagnosis",  bgcolor = color.new(color.black, 20), text_color = color.white)
+    table.cell(agentTable, 2, 0, "OK?",        bgcolor = color.new(color.black, 20), text_color = color.white)
+
+    table.cell(agentTable, 0, 1, "L1 Math",    text_color = color.white)
+    table.cell(agentTable, 1, 1, "VR=" + str.tostring(vr, "#.##"),      text_color = color.white)
+    table.cell(agentTable, 2, 1, l1_math_MR_regime ? "✓" : "✗", text_color = l1_math_MR_regime ? color.green : color.red)
+
+    table.cell(agentTable, 0, 2, "L2 Phys",    text_color = color.white)
+    table.cell(agentTable, 1, 2, "ar=" + str.tostring(atrRatio, "#.##") + " τ=" + str.tostring(tailSig, "#.#"), text_color = color.white)
+    table.cell(agentTable, 2, 2, l2_phys_phase_NORMAL ? "✓" : "✗", text_color = l2_phys_phase_NORMAL ? color.green : color.red)
+
+    astroDiagL = l3_astro_long  ? "LONG"  : l3_astro_short ? "SHORT" : "—"
+    table.cell(agentTable, 0, 3, "L3 Astro",   text_color = color.white)
+    table.cell(agentTable, 1, 3, "z=" + str.tostring(zRaw, "#.##") + " " + astroDiagL, text_color = color.white)
+    table.cell(agentTable, 2, 3, (l3_astro_long or l3_astro_short) ? "✓" : "—", text_color = (l3_astro_long or l3_astro_short) ? color.green : color.gray)
+
+    hmmLabel = state_now == 1 ? "UP" : state_now == -1 ? "DOWN" : "FLAT"
+    table.cell(agentTable, 0, 4, "L4 HMM",     text_color = color.white)
+    table.cell(agentTable, 1, 4, hmmLabel + (state_stable ? "(stable)" : "(trans)"), text_color = color.white)
+    table.cell(agentTable, 2, 4, state_stable ? "✓" : "✗", text_color = state_stable ? color.green : color.red)
+
+    table.cell(agentTable, 0, 5, "L5 Crypto",  text_color = color.white)
+    table.cell(agentTable, 1, 5, "h=" + str.tostring(hUtc) + " dow=" + str.tostring(dow), text_color = color.white)
+    table.cell(agentTable, 2, 5, l5_crypto_high_edge ? "✓" : "✗", text_color = l5_crypto_high_edge ? color.green : color.red)
+
+    table.cell(agentTable, 0, 6, "L6 Quant",   bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(agentTable, 1, 6, "L=" + str.tostring(longCount) + "/5 S=" + str.tostring(shortCount) + "/5", text_color = color.white)
+    table.cell(agentTable, 2, 6, (longConfluence or shortConfluence) ? "FIRE" : "HOLD", text_color = (longConfluence or shortConfluence) ? color.green : color.gray)
+
+    table.cell(agentTable, 0, 7, "DD/α",       bgcolor = color.new(color.yellow, 80), text_color = color.white)
+    table.cell(agentTable, 1, 7, str.tostring(ddPct, "#.#") + "%", text_color = color.white)
+    table.cell(agentTable, 2, 7, "α=" + str.tostring(alpha, "#.##"), text_color = alpha < 1 ? color.orange : color.green)
