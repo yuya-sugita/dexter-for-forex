@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 // ============================================================================
 // Renaissance Core Strategy — XAUUSD 1h  (v2: 6-Agent Confluence Edition)
 // ============================================================================
@@ -142,10 +142,9 @@ state_now   = slopeFrac > hmmSlopePct ? 1 : slopeFrac < -hmmSlopePct ? -1 : 0
 
 // state の連続性判定 (Viterbi path の安定 = 復号の信頼度)
 state_stable = true
-for i = 1 to 10
-    if i <= hmmHold
-        if state_now != nz(state_now[i])
-            state_stable := false
+for i = 1 to hmmHold
+    if state_now != nz(state_now[i])
+        state_stable := false
 
 l4_hmm_long  = state_stable and (state_now == 0 or state_now == 1)
 l4_hmm_short = state_stable and (state_now == 0 or state_now == -1)

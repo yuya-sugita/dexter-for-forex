@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 // Renaissance Core Strategy — XAUUSD 1h
 // 生成原理: 独立な弱シグナルの AND 結合（Prompt 6 × Prompt 10 × Prompt 11）
 // 層構成:
