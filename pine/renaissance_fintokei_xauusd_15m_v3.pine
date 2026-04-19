@@ -197,7 +197,7 @@ var float dayStartEq     = na
 var int   dayTradeCount  = 0
 var bool  dayHaltedFlag  = false
 
-today = dayofyear(time, "UTC") + year(time, "UTC") * 1000
+today = year(time, "UTC") * 10000 + month(time, "UTC") * 100 + dayofmonth(time, "UTC")
 isNewDay = na(currentDay) or currentDay != today
 if isNewDay
     currentDay := today
