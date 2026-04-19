@@ -1,0 +1,368 @@
+//@version=6
+// ============================================================================
+// Renaissance Fintokei — XAUUSD 15m  (v3.2: R:R 1:1 Arithmetic Fix)
+// ============================================================================
+//
+// v3.1 の単一算術ミス修正版。v3.1 では zTP=1.0 / zStop=3.0 としたが、
+// zEntry=2.5 との距離計算で TP 距離 1.5σ / Stop 距離 0.5σ となり、実効
+// R:R = 3:1 (ユーザー要件の 1:1 に違反) だった。ペイオフ 2.315 はこの
+// 幾何非対称の結果であり、勝率 29% (狭いストップで反転ノイズに被弾) も同因。
+//
+// v3.1 → v3.2 の変更は **算術ミス 1 点のみ**:
+//   zTakeProfit: 1.0 → 1.5  (TP 距離 2.5-1.5 = 1.0σ)
+//   zStopLoss:   3.0 → 3.5  (Stop 距離 3.5-2.5 = 1.0σ、R:R 1:1 復活)
+//
+// カーブフィット回避のため、他の一切のパラメータ・ロジックは触らない。
+// TP/Stop ロック機能、L4 方向別ゲート、baseRisk 0.3% は v3.1 を継承。
+//
+// v3.1 で得た 2 つの成果のうち、構造的なもの (TP/Stop ロック、L4 ゲート、
+// baseRisk 縮小) は保持し、非構造的な幾何の非対称は除去する。
+// Prompt 11: 生成原理がシンプルなまま次元を保つ。
+//
+// ============================================================================
+
+strategy(
+     title                   = "Renaissance Fintokei XAUUSD 15m v3.2",
+     shorttitle              = "RenFT15.2",
+     overlay                 = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 0,
+     pyramiding              = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = true,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.01)
+
+// ============================================================================
+// Inputs — 層パラメータと Fintokei ガード閾値
+// ============================================================================
+
+// --- L1 Mathematician ---
+mathLookback = input.int(100, "L1 Variance-Ratio Lookback", minval = 50, maxval = 300, group = "L1 Mathematician")
+mathK        = input.int(5,   "L1 Variance-Ratio Lag k",    minval = 2,  maxval = 20,  group = "L1 Mathematician")
+mathVRMax    = input.float(0.95, "L1 VR Upper Bound",       minval = 0.5, maxval = 1.2, step = 0.05, group = "L1 Mathematician")
+
+// --- L2 Physicist ---
+physLaminarLo  = input.float(0.5,  "L2 Laminar Lower",  minval = 0.1, maxval = 0.9, step = 0.05, group = "L2 Physicist")
+physCriticalHi = input.float(1.6,  "L2 Critical Upper", minval = 1.1, maxval = 3.0, step = 0.1,  group = "L2 Physicist")
+physTailSigma  = input.float(4.0,  "L2 Tail σ Max",     minval = 2.0, maxval = 6.0, step = 0.5,  group = "L2 Physicist")
+
+// --- L3 Astronomer (size factor) ---
+astroLookback     = input.int(5,    "L3 Persistence window",       minval = 3,   maxval = 20,  group = "L3 Astronomer")
+astroPersistMin   = input.float(1.0, "L3 |z| persistence threshold", minval = 0.5, maxval = 2.0, step = 0.1, group = "L3 Astronomer")
+astroFactorWeak   = input.float(0.5, "L3 Size factor (weak)",       minval = 0.0, maxval = 1.0, step = 0.1, group = "L3 Astronomer")
+
+// --- L4 HMM (size factor) ---
+hmmSlopePct       = input.float(0.003, "L4 Slope threshold",         minval = 0.001, maxval = 0.02, step = 0.001, group = "L4 Speech-Recognition")
+hmmHold           = input.int(8,        "L4 State-hold bars",        minval = 2,     maxval = 30,   group = "L4 Speech-Recognition")
+hmmFactorWeak     = input.float(0.5,    "L4 Size factor (transit.)", minval = 0.0,   maxval = 1.0,  step = 0.1, group = "L4 Speech-Recognition")
+
+// --- L5 Cryptanalyst ---
+cryptoStartH      = input.int(13,    "L5 Core session start (UTC)", minval = 0, maxval = 23, group = "L5 Cryptanalyst")
+cryptoEndH        = input.int(20,    "L5 Core session end (UTC)",   minval = 0, maxval = 23, group = "L5 Cryptanalyst")
+cryptoBlackoutData = input.bool(true, "L5 Blackout US data hours",  group = "L5 Cryptanalyst")
+
+// --- L6 Order geometry (z-score levels) ---
+// v3.2: 算術ミス修正。R:R 1:1 対称 (TP 距離 1.0σ / Stop 距離 1.0σ)。
+zLookback   = input.int(20,   "L6 z lookback",   minval = 10, maxval = 100, group = "L6 Order Geometry")
+zEntry      = input.float(2.5, "L6 z entry",     minval = 1.5, maxval = 4.0, step = 0.1, group = "L6 Order Geometry")
+zTakeProfit = input.float(1.5, "L6 z take-profit", minval = 0.0, maxval = 2.5, step = 0.1, group = "L6 Order Geometry")
+zStopLoss   = input.float(3.5, "L6 z stop-loss", minval = 2.0, maxval = 5.0, step = 0.1, group = "L6 Order Geometry")
+limitMaxAge = input.int(8,    "L6 Limit max age (bars)", minval = 2, maxval = 30, group = "L6 Order Geometry")
+
+// --- Fintokei guards ---
+// v3.1 変更: base risk 0.5% → 0.3% (最大 DD 縮小マージン)
+baseRiskPct      = input.float(0.3, "Base risk per trade %", minval = 0.1, maxval = 2.0, step = 0.1, group = "Fintokei Guards")
+maxDailyDDpct    = input.float(2.5, "Daily DD circuit %",    minval = 1.0, maxval = 5.0, step = 0.5, group = "Fintokei Guards")
+maxTradesPerDay  = input.int(6,     "Max trades / day",      minval = 1,   maxval = 20,  group = "Fintokei Guards")
+ddTier1Pct       = input.float(5.0, "Total DD α=0.50 %",     minval = 2.0, maxval = 10.0, step = 0.5, group = "Fintokei Guards")
+ddTier2Pct       = input.float(7.0, "Total DD α=0.25 %",     minval = 3.0, maxval = 12.0, step = 0.5, group = "Fintokei Guards")
+ddTier3Pct       = input.float(9.0, "Total DD α=0.00 %",     minval = 5.0, maxval = 15.0, step = 0.5, group = "Fintokei Guards")
+fridayCloseH     = input.int(21,    "Friday flat hour (UTC)", minval = 18, maxval = 23, group = "Fintokei Guards")
+
+// ============================================================================
+// Shared primitives — Prompt 9: 全層が同じ原始量を参照
+// ============================================================================
+
+ret1   = close - close[1]
+ret5   = close - close[5]
+atr14  = ta.atr(14)
+atr100 = ta.sma(atr14, 100)
+sma20  = ta.sma(close, zLookback)
+std20  = ta.stdev(close, zLookback)
+sma50  = ta.sma(close, 50)
+hUtc   = hour(time, "UTC")
+mUtc   = minute(time, "UTC")
+dow    = dayofweek(time, "UTC")
+zRaw   = std20 > 0 ? (close - sma20) / std20 : 0.0
+
+// ============================================================================
+// L1 — MATHEMATICIAN: variance ratio で平均回帰位相の同定 [GATE]
+// ============================================================================
+var1 = ta.variance(ret1, mathLookback)
+varK = ta.variance(ret5, mathLookback)
+vr   = var1 > 0 ? varK / (mathK * var1) : 1.0
+l1_math_OK = vr < mathVRMax
+
+// ============================================================================
+// L2 — PHYSICIST: 相分類 (NORMAL のみエントリー可) [GATE]
+// ============================================================================
+atrRatio = atr100 > 0 ? atr14 / atr100 : 1.0
+sdRet    = ta.stdev(ret1, 100)
+maxAbs   = ta.highest(math.abs(ret1), 20)
+tailSig  = sdRet > 0 ? maxAbs / sdRet : 0.0
+l2_phys_OK = atrRatio >= physLaminarLo and atrRatio <= physCriticalHi and tailSig < physTailSigma
+
+// ============================================================================
+// L3 — ASTRONOMER: z 持続性 → サイズ係数 [SIZE]
+// ============================================================================
+// 過去 astroLookback バーの平均 |z| が閾値以上なら「観測信号が立っている」
+// → サイズ 1.0。閾値未満ならノイズ寄り → サイズ astroFactorWeak。
+absZ = math.abs(zRaw)
+avgAbsZ = ta.sma(absZ, astroLookback)
+l3_astro_factor = avgAbsZ >= astroPersistMin ? 1.0 : astroFactorWeak
+
+// ============================================================================
+// L4 — SPEECH-RECOGNITION: HMM 状態安定性 → 方向別ゲート [DIRECTIONAL GATE]
+// ============================================================================
+// v3.1 変更: サイズ係数 → 方向別ゲート。
+// XAUUSD v3 実測で UP トレンド中のショートが -447 USD (総損失の 58%) を
+// 生んでいた。HMM 状態に応じてトレンド逆行方向を完全禁止する (サイズ 0)。
+//   state=UP   → ショート禁止、ロングのみ (または FLAT 状態を待つ)
+//   state=DOWN → ロング禁止、ショートのみ
+//   state=FLAT → 両方向可
+// state が不安定 (transition) な時は両方向サイズ係数 hmmFactorWeak で縮小。
+sma50_20ago = sma50[20]
+slopeFrac   = sma50_20ago > 0 ? (sma50 - sma50_20ago) / sma50_20ago : 0.0
+state_now   = slopeFrac > hmmSlopePct ? 1 : slopeFrac < -hmmSlopePct ? -1 : 0
+
+state_stable = true
+for i = 1 to hmmHold
+    if state_now != nz(state_now[i])
+        state_stable := false
+
+// 方向別の許可フラグ + サイズ係数 (transition 時のみ weak)
+l4_long_allowed  = state_stable ? (state_now != -1) : true     // DOWN 時のみロング禁止
+l4_short_allowed = state_stable ? (state_now !=  1) : true     // UP   時のみショート禁止
+l4_hmm_factor    = state_stable ? 1.0 : hmmFactorWeak          // transit 中は縮小
+
+// ============================================================================
+// L5 — CRYPTANALYST: 時間帯/曜日条件 + 経済発表ブラックアウト [GATE]
+// ============================================================================
+inCore       = hUtc >= cryptoStartH and hUtc < cryptoEndH
+fridayLate   = dow == dayofweek.friday and hUtc >= 20
+sundayOpen   = dow == dayofweek.sunday
+// US データ発表時刻 (典型: 12:30 UTC = NFP/CPI, 14:00 UTC = FOMC/JOLTs)
+// その時刻 ± 30 分をブラックアウト
+near1230 = (hUtc == 12 and mUtc >= 0) or (hUtc == 13 and mUtc < 0)
+near1400 = (hUtc == 13 and mUtc >= 30) or (hUtc == 14) or (hUtc == 15 and mUtc < 0)
+dataBlackout = cryptoBlackoutData and (near1230 or near1400)
+
+l5_crypto_OK = inCore and not fridayLate and not sundayOpen and not dataBlackout
+
+// ============================================================================
+// L6 — QUANT-ANALYST: 翻訳と執行
+// ============================================================================
+// 状態ゲート (L1∧L2∧L5) が成立した時のみ、L3×L4 のサイズ係数を反映した
+// 指値ブレケット (OCO) を long/short 両側に投入する。
+// 片側が約定したら反対側を即キャンセル。
+
+state_OK = l1_math_OK and l2_phys_OK and l5_crypto_OK
+
+// --- DD 制御 (Prompt 8 の機械的スカラー縮小) ---
+var float peakEq = strategy.initial_capital
+peakEq := math.max(peakEq, strategy.equity)
+ddPct  = peakEq > 0 ? (peakEq - strategy.equity) / peakEq * 100.0 : 0.0
+
+alpha_dd = ddPct >= ddTier3Pct ? 0.00 :
+           ddPct >= ddTier2Pct ? 0.25 :
+           ddPct >= ddTier1Pct ? 0.50 : 1.00
+
+// --- 日次トラッキング (Fintokei daily DD 制限への対応) ---
+var int   currentDay     = na
+var float dayStartEq     = na
+var int   dayTradeCount  = 0
+var bool  dayHaltedFlag  = false
+
+today = year(time, "UTC") * 10000 + month(time, "UTC") * 100 + dayofmonth(time, "UTC")
+isNewDay = na(currentDay) or currentDay != today
+if isNewDay
+    currentDay := today
+    dayStartEq := strategy.equity
+    dayTradeCount := 0
+    dayHaltedFlag := false
+
+dailyPnLpct = (not na(dayStartEq) and dayStartEq > 0) ?
+              (strategy.equity - dayStartEq) / dayStartEq * 100.0 : 0.0
+
+if dailyPnLpct <= -maxDailyDDpct
+    dayHaltedFlag := true
+
+// --- 金曜クローズ ---
+fridayHaltTime = dow == dayofweek.friday and hUtc >= fridayCloseH
+
+// --- 投入許可 ---
+canPlace = state_OK and alpha_dd > 0 and not dayHaltedFlag and not fridayHaltTime and (dayTradeCount < maxTradesPerDay) and (strategy.position_size == 0)
+
+// --- z レベル → 価格 ---
+longEntryPx  = sma20 - zEntry      * std20
+longTpPx     = sma20 - zTakeProfit * std20
+longStopPx   = sma20 - zStopLoss   * std20
+shortEntryPx = sma20 + zEntry      * std20
+shortTpPx    = sma20 + zTakeProfit * std20
+shortStopPx  = sma20 + zStopLoss   * std20
+
+// --- ストップ距離 (リスク逆算用) ---
+stopDistAbs = (zStopLoss - zEntry) * std20  // |entry-stop| in price units
+
+// --- サイズ係数とリスク% ---
+sizeFactor = l3_astro_factor * l4_hmm_factor   // 0.25 / 0.5 / 1.0 のいずれか
+riskPct    = baseRiskPct * alpha_dd * sizeFactor
+riskAmount = strategy.equity * (riskPct / 100.0)
+qtyUnits   = (stopDistAbs > 0 and riskAmount > 0) ? riskAmount / stopDistAbs : 0.0
+
+// --- 指値ブレケット投入 (L4 方向別ゲートに従い片側のみ or 両側) ---
+// ID は固定 ("L"/"S")。state_OK の間は最新の z レベルに指値を追従させる。
+// v3.1: L4 が逆方向を禁止している時はその side を投入しない (= サイズ 0)。
+place_long  = canPlace and l4_long_allowed  and qtyUnits > 0 and longEntryPx  < close
+place_short = canPlace and l4_short_allowed and qtyUnits > 0 and shortEntryPx > close
+
+// TP/Stop 価格ロック: 約定後は entry_avg_price + 固定 σ オフセットで固定する。
+// std20 は約定時点の値を使う (エントリーバーの std20 で bracket 幅を決定)。
+var float lockedLongTp   = na
+var float lockedLongStop = na
+var float lockedShortTp  = na
+var float lockedShortStop= na
+
+// 約定検知: ポジション ≠ 0 で前バーが = 0 の瞬間に TP/Stop をロック
+justFilledLong  = strategy.position_size > 0 and strategy.position_size[1] == 0
+justFilledShort = strategy.position_size < 0 and strategy.position_size[1] == 0
+
+if justFilledLong
+    lockedLongTp   := strategy.position_avg_price + (zEntry - zTakeProfit) * std20
+    lockedLongStop := strategy.position_avg_price - (zStopLoss - zEntry) * std20
+
+if justFilledShort
+    lockedShortTp   := strategy.position_avg_price - (zEntry - zTakeProfit) * std20
+    lockedShortStop := strategy.position_avg_price + (zStopLoss - zEntry) * std20
+
+// 平衡 (ポジションなし) になったらロック解除
+if strategy.position_size == 0
+    lockedLongTp    := na
+    lockedLongStop  := na
+    lockedShortTp   := na
+    lockedShortStop := na
+
+confTag = "α=" + str.tostring(alpha_dd, "#.##") + " sz=" + str.tostring(sizeFactor, "#.##") + " dd=" + str.tostring(ddPct, "#.#") + "%"
+
+// ロング: ポジションありならロック値で exit 維持、なしなら動的値で bracket 予約
+if strategy.position_size > 0 and not na(lockedLongTp)
+    strategy.exit("L_x", from_entry = "L", limit = lockedLongTp, stop = lockedLongStop)
+else if place_long
+    strategy.entry("L", strategy.long,  qty = qtyUnits, limit = longEntryPx,  comment = "L " + confTag)
+    strategy.exit ("L_x", from_entry = "L", limit = longTpPx,  stop = longStopPx)
+else if strategy.position_size == 0
+    strategy.cancel("L")
+
+// ショート: 同上
+if strategy.position_size < 0 and not na(lockedShortTp)
+    strategy.exit("S_x", from_entry = "S", limit = lockedShortTp, stop = lockedShortStop)
+else if place_short
+    strategy.entry("S", strategy.short, qty = qtyUnits, limit = shortEntryPx, comment = "S " + confTag)
+    strategy.exit ("S_x", from_entry = "S", limit = shortTpPx, stop = shortStopPx)
+else if strategy.position_size == 0
+    strategy.cancel("S")
+
+// --- 状態ゲートが崩れたら両側の未約定指値をキャンセル (ポジションありなら維持) ---
+if (not canPlace) and strategy.position_size == 0
+    strategy.cancel("L")
+    strategy.cancel("S")
+
+// --- 古い未約定指値の年齢管理 ---
+// 直近 limitMaxAge バーの間に置かれた指値がなければ、stale と見做して再構築させる
+var int lastPlacedBar = na
+if place_long or place_short
+    lastPlacedBar := bar_index
+if not na(lastPlacedBar) and (bar_index - lastPlacedBar) > limitMaxAge and strategy.position_size == 0
+    strategy.cancel("L")
+    strategy.cancel("S")
+    lastPlacedBar := na
+
+// --- 約定検知 → 反対側キャンセル + 日次カウンタ ---
+positionJustOpened = strategy.position_size != 0 and strategy.position_size[1] == 0
+if positionJustOpened
+    dayTradeCount := dayTradeCount + 1
+    if strategy.position_size > 0
+        strategy.cancel("S")
+    else
+        strategy.cancel("L")
+
+// --- 金曜強制クローズ ---
+if fridayHaltTime
+    strategy.cancel("L")
+    strategy.cancel("S")
+    if strategy.position_size != 0
+        strategy.close_all(comment = "friday-flat")
+
+// --- 日次サーキットブレーカ発動時: 新規禁止 (既存ポジは bracket に任せる) ---
+if dayHaltedFlag and strategy.position_size == 0
+    strategy.cancel("L")
+    strategy.cancel("S")
+
+// ============================================================================
+// Visualization — 取引ロジックには影響しない診断レイヤ
+// ============================================================================
+
+plot(sma20,        title = "SMA(20) mean",     color = color.new(color.aqua,    40))
+plot(longEntryPx,  title = "z=-2.5 (L entry)", color = color.new(color.green,   30), linewidth = 1, style = plot.style_circles)
+plot(longTpPx,     title = "z=-1.5 (L TP)",    color = color.new(color.green,   60), linewidth = 1)
+plot(longStopPx,   title = "z=-3.5 (L stop)",  color = color.new(color.red,     60), linewidth = 1)
+plot(shortEntryPx, title = "z=+2.5 (S entry)", color = color.new(color.red,     30), linewidth = 1, style = plot.style_circles)
+plot(shortTpPx,    title = "z=+1.5 (S TP)",    color = color.new(color.red,     70), linewidth = 1)
+plot(shortStopPx,  title = "z=+3.5 (S stop)",  color = color.new(color.green,   70), linewidth = 1)
+
+bgcolor(not l1_math_OK   ? color.new(color.purple, 92) : na, title = "L1 Math OFF")
+bgcolor(not l2_phys_OK   ? color.new(color.red,    92) : na, title = "L2 Phys OFF")
+bgcolor(not l5_crypto_OK ? color.new(color.orange, 93) : na, title = "L5 Crypto OFF")
+bgcolor(dayHaltedFlag    ? color.new(color.maroon, 85) : na, title = "Daily DD halt")
+bgcolor(fridayHaltTime   ? color.new(color.gray,   85) : na, title = "Friday flat")
+
+// 状態ダッシュボード
+var table dash = table.new(position.top_right, 3, 9, border_width = 1)
+if barstate.islast
+    table.cell(dash, 0, 0, "Layer",     bgcolor = color.new(color.black, 20), text_color = color.white)
+    table.cell(dash, 1, 0, "Reading",   bgcolor = color.new(color.black, 20), text_color = color.white)
+    table.cell(dash, 2, 0, "Status",    bgcolor = color.new(color.black, 20), text_color = color.white)
+
+    table.cell(dash, 0, 1, "L1 Math",   text_color = color.white)
+    table.cell(dash, 1, 1, "VR=" + str.tostring(vr, "#.##"), text_color = color.white)
+    table.cell(dash, 2, 1, l1_math_OK ? "GATE ✓" : "GATE ✗", text_color = l1_math_OK ? color.green : color.red)
+
+    table.cell(dash, 0, 2, "L2 Phys",   text_color = color.white)
+    table.cell(dash, 1, 2, "ar=" + str.tostring(atrRatio, "#.##") + " τ=" + str.tostring(tailSig, "#.#"), text_color = color.white)
+    table.cell(dash, 2, 2, l2_phys_OK ? "GATE ✓" : "GATE ✗", text_color = l2_phys_OK ? color.green : color.red)
+
+    table.cell(dash, 0, 3, "L3 Astro",  text_color = color.white)
+    table.cell(dash, 1, 3, "<|z|>=" + str.tostring(avgAbsZ, "#.##"), text_color = color.white)
+    table.cell(dash, 2, 3, "size×" + str.tostring(l3_astro_factor, "#.##"), text_color = color.white)
+
+    table.cell(dash, 0, 4, "L4 HMM",    text_color = color.white)
+    table.cell(dash, 1, 4, (state_now == 1 ? "UP" : state_now == -1 ? "DN" : "FL") + (state_stable ? "(s)" : "(t)"), text_color = color.white)
+    table.cell(dash, 2, 4, "size×" + str.tostring(l4_hmm_factor, "#.##"), text_color = color.white)
+
+    table.cell(dash, 0, 5, "L5 Crypto", text_color = color.white)
+    table.cell(dash, 1, 5, "h=" + str.tostring(hUtc) + ":" + str.tostring(mUtc) + " dow=" + str.tostring(dow), text_color = color.white)
+    table.cell(dash, 2, 5, l5_crypto_OK ? "GATE ✓" : "GATE ✗", text_color = l5_crypto_OK ? color.green : color.red)
+
+    table.cell(dash, 0, 6, "Total DD",  bgcolor = color.new(color.yellow, 80), text_color = color.white)
+    table.cell(dash, 1, 6, str.tostring(ddPct, "#.##") + "%", text_color = color.white)
+    table.cell(dash, 2, 6, "α=" + str.tostring(alpha_dd, "#.##"), text_color = alpha_dd < 1 ? color.orange : color.green)
+
+    table.cell(dash, 0, 7, "Daily PnL", bgcolor = color.new(color.yellow, 80), text_color = color.white)
+    table.cell(dash, 1, 7, str.tostring(dailyPnLpct, "#.##") + "%", text_color = dayHaltedFlag ? color.red : color.white)
+    table.cell(dash, 2, 7, dayHaltedFlag ? "HALT" : (str.tostring(dayTradeCount) + "/" + str.tostring(maxTradesPerDay)), text_color = dayHaltedFlag ? color.red : color.white)
+
+    table.cell(dash, 0, 8, "Order",     bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(dash, 1, 8, "qty=" + str.tostring(qtyUnits, "#.###"), text_color = color.white)
+    table.cell(dash, 2, 8, canPlace ? "ARMED" : "IDLE", text_color = canPlace ? color.green : color.gray)
